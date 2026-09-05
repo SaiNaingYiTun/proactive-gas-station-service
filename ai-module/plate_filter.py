@@ -1,22 +1,29 @@
 import re
 
 
-_ALLOWED_RE = re.compile(r"^[ก-๙0-9]+$")
-
-
 def normalize_plate_text(text):
     if not text:
         return ""
-    return re.sub(r"[\s\-_.|]+", "", text.strip())
+    text = text.strip()
+    text = re.sub(r"[^0-9ก-ฮ]", "", text)
+    return text
 
 
 def is_plausible_plate_text(text):
+    text = normalize_plate_text(text)
     if not text:
         return False
-    if not _ALLOWED_RE.match(text):
-        return False
-    thai_count = sum(1 for char in text if "ก" <= char <= "๛")
-    digit_count = sum(1 for char in text if char.isdigit())
-    if len(text) < 4:
-        return False
-    return thai_count >= 1 and digit_count >= 2
+
+    # Thai private-vehicle plates normally use Thai letters followed by digits.
+    # Some registrations use a leading digit followed by Thai letters and the
+    # serial digits (for example "4กข9517"), so accept that form as well.
+    # Reject a number-only fragment (for example "921"): it is often read
+    # from a building, timestamp, or incomplete plate and must not be sent to
+    # the backend as a registration number.
+    # A two-character result such as "ว3" is almost always an OCR fragment,
+    # not a usable registration.  Require at least two digits and a minimum
+    # of three total characters before it can reach the stabilizer/backend.
+    if re.fullmatch(r"(?:[ก-ฮ]{1,5}\d{2,4}|\d[ก-ฮ]{1,3}\d{2,4})", text):
+        return True
+
+    return False
