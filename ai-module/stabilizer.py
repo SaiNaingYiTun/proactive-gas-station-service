@@ -36,6 +36,22 @@ class PlateStabilizer:
         if best_key is not None and best_score >= self.similarity_threshold:
             return best_key
 
+        # OCR commonly varies by one Thai letter or one serial digit on a
+        # small, tilted plate (for example "บว1433" vs "ทว1430").  Treat
+        # those as one candidate only when they have the same length, at
+        # least three digits, and agree on at least 75% of the digit string.
+        # This is intentionally narrower than lowering the general text
+        # similarity threshold, which would also merge unrelated provinces.
+        digits = "".join(char for char in text if char.isdigit())
+        if len(digits) >= 3:
+            for candidate_key in self._candidates:
+                candidate_digits = "".join(char for char in candidate_key if char.isdigit())
+                if len(text) != len(candidate_key) or len(digits) != len(candidate_digits):
+                    continue
+                digit_score = SequenceMatcher(None, digits, candidate_digits).ratio()
+                if digit_score >= 0.75:
+                    return candidate_key
+
         return None
 
     def offer(self, text, conf, province, now):
@@ -62,7 +78,13 @@ class PlateStabilizer:
         candidate["hits"] += 1
         previous_best_conf = candidate["best_conf"]
         candidate["best_conf"] = max(candidate["best_conf"], conf)
-        if conf >= previous_best_conf or len(text) > len(candidate["best_text"]):
+        # OCR can read a real plate correctly once, then later drop a digit
+        # with a slightly higher confidence.  Never replace a longer plate
+        # reading with its shorter fragment merely because of confidence.
+        if len(text) > len(candidate["best_text"]) or (
+            len(text) == len(candidate["best_text"])
+            and conf >= previous_best_conf
+        ):
             candidate["best_text"] = text
         candidate["province"] = province or candidate["province"]
         candidate["last_seen"] = now

@@ -3,11 +3,18 @@ import requests
 from config import API_BASE, CAMERA_ID
 
 
-def send_detection(plate, conf):
+def send_detection(event_id, plate, conf, color="unknown"):
     try:
         response = requests.post(
             f"{API_BASE}/api/detection",
-            json={"plate_number": plate, "vehicle_type": "car", "confidence": conf, "camera_id": CAMERA_ID},
+            json={
+                "event_id": event_id,
+                "plate_number": plate,
+                "vehicle_type": "car",
+                "color": color,
+                "confidence": conf,
+                "camera_id": CAMERA_ID,
+            },
             timeout=3,
         )
         return response.json()
@@ -16,9 +23,13 @@ def send_detection(plate, conf):
         return None
 
 
-def send_exit(plate):
+def send_exit(event_id, plate):
     try:
-        response = requests.put(f"{API_BASE}/api/exit", json={"plate_number": plate}, timeout=3)
+        response = requests.put(
+            f"{API_BASE}/api/exit",
+            json={"event_id": event_id, "plate_number": plate, "camera_id": CAMERA_ID},
+            timeout=3,
+        )
         return response.json()
     except Exception as error:
         print(f"⚠️  Exit error: {error}")
