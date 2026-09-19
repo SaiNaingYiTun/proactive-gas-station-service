@@ -52,6 +52,31 @@ class PlateStabilizer:
                 if digit_score >= 0.75:
                     return candidate_key
 
+        # The trained character model can also miss exactly one digit at the
+        # very start or end of an otherwise-correct plate -- typically the
+        # last digit, when it is small, blurry, or its confidence lands just
+        # under the detector's own per-character threshold.  It has also been
+        # seen to simultaneously misread a repeated-letter prefix as a single
+        # different letter (for example "ฆฆ5176" read a second time as
+        # "ม517": the model detected "ฆ" twice but at ~0.06 confidence, below
+        # the character-confidence gate, and never proposed a box for the
+        # trailing "6" at all), so this intentionally does not require the
+        # letter portion -- or even the total length -- to agree; each
+        # PlateStabilizer instance already belongs to one tracked vehicle, so
+        # there is no unrelated plate for a stray digit-prefix match to
+        # collide with.  Only merge when one read's digit string is a prefix
+        # or suffix of the other's and they differ by exactly one digit --
+        # this forgives a single dropped digit, never a genuinely different
+        # serial.
+        if len(digits) >= 3:
+            for candidate_key in self._candidates:
+                candidate_digits = "".join(char for char in candidate_key if char.isdigit())
+                if abs(len(digits) - len(candidate_digits)) != 1:
+                    continue
+                shorter_digits, longer_digits = sorted((digits, candidate_digits), key=len)
+                if longer_digits.startswith(shorter_digits) or longer_digits.endswith(shorter_digits):
+                    return candidate_key
+
         return None
 
     def offer(self, text, conf, province, now):

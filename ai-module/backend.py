@@ -3,15 +3,19 @@ import requests
 from config import API_BASE, CAMERA_ID
 
 
-def send_detection(event_id, plate, conf, color="unknown"):
+def send_detection(event_id, plate, conf, color="unknown", make="unknown"):
     try:
         response = requests.post(
             f"{API_BASE}/api/detection",
             json={
                 "event_id": event_id,
-                "plate_number": plate,
+                # This camera's entry view usually has no visible plate; send
+                # None rather than "" so the backend stores a real NULL and
+                # matches this entry to its exit by colour/make instead.
+                "plate_number": plate or None,
                 "vehicle_type": "car",
                 "color": color,
+                "make": make,
                 "confidence": conf,
                 "camera_id": CAMERA_ID,
             },
@@ -23,11 +27,17 @@ def send_detection(event_id, plate, conf, color="unknown"):
         return None
 
 
-def send_exit(event_id, plate):
+def send_exit(event_id, plate, color="unknown", make="unknown"):
     try:
         response = requests.put(
             f"{API_BASE}/api/exit",
-            json={"event_id": event_id, "plate_number": plate, "camera_id": CAMERA_ID},
+            json={
+                "event_id": event_id,
+                "plate_number": plate,
+                "camera_id": CAMERA_ID,
+                "color": color,
+                "make": make,
+            },
             timeout=3,
         )
         return response.json()

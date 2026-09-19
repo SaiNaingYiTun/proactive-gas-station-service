@@ -16,3 +16,16 @@ node_modules/
 # Mac/Windows
 .DS_Store
 Thumbs.db
+
+# AI module: debug output, training runs, and raw/labeled vehicle footage.
+# These are large binary artifacts and/or contain real license-plate images,
+# so keep them local rather than committing them.
+ai-module/debug_crops/
+ai-module/runs/
+# brand_dataset is a classify-style dataset: one folder per make under
+# train/ and val/. Ignore every image inside each class folder but keep the
+# folder (and its .gitkeep) so the scaffold itself stays committed.
+ai-module/brand_dataset/train/*/*
+ai-module/brand_dataset/val/*/*
+!ai-module/brand_dataset/train/*/.gitkeep
+!ai-module/brand_dataset/val/*/.gitkeep

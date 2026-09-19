@@ -10,7 +10,11 @@ import os
 import torch
 from ultralytics import YOLO
 
-from config import CHARACTER_MODEL_MIN_CONF, CHARACTER_MODEL_PATH, DEBUG_THAI_PLATE, PLATE_LINE_SPLIT_RATIO
+from config import (
+    CHARACTER_AMBIGUOUS_MARGIN, CHARACTER_GAP_MIN_CONF, CHARACTER_MODEL_MIN_CONF,
+    CHARACTER_MODEL_PATH, CHARACTER_OVERLAP_RATIO, DEBUG_THAI_PLATE,
+    PLATE_LINE_SPLIT_RATIO,
+)
 from plate_filter import is_plausible_plate_text
 
 
@@ -68,6 +72,67 @@ def _label(model, class_id):
     return str(names[class_id] if isinstance(names, dict) else names[class_id])
 
 
+def _resolve_overlapping_characters(boxes):
+    """Collapse duplicate detections that cover the same physical character.
+
+    ``model()`` runs per-class NMS, so two different classes proposed for the
+    same glyph (e.g. a blurry "0" the model also half-reads as "9") both
+    survive independently -- silently inflating the character count and, on
+    a short plate, pushing it over the maximum digit length into
+    "<invalid>".  Group boxes that heavily overlap and keep only the
+    strongest one.  When the top two candidates at one position are close in
+    confidence, the model is not actually sure which is right; drop that
+    position rather than let a marginal confidence edge become a "confirmed"
+    character the OCR pipeline then treats as certain.
+    """
+    remaining = sorted(boxes, key=lambda item: item[5], reverse=True)
+    resolved, dropped_ambiguous = [], []
+    while remaining:
+        best = remaining.pop(0)
+        bx1, by1, bx2, by2 = best[:4]
+        best_area = max(1.0, (bx2 - bx1) * (by2 - by1))
+        group, still_remaining = [best], []
+        for other in remaining:
+            ox1, oy1, ox2, oy2 = other[:4]
+            left, top = max(bx1, ox1), max(by1, oy1)
+            right, bottom = min(bx2, ox2), min(by2, oy2)
+            intersection = max(0, right - left) * max(0, bottom - top)
+            other_area = max(1.0, (ox2 - ox1) * (oy2 - oy1))
+            if intersection / min(best_area, other_area) >= CHARACTER_OVERLAP_RATIO:
+                group.append(other)
+            else:
+                still_remaining.append(other)
+        remaining = still_remaining
+        if len(group) == 1 or group[0][5] - group[1][5] >= CHARACTER_AMBIGUOUS_MARGIN:
+            resolved.append(group[0])
+        else:
+            dropped_ambiguous.append(group)
+    return resolved, dropped_ambiguous
+
+
+def _has_internal_gap(characters, weak_positions):
+    """Detect a likely-missed character sitting between two accepted ones.
+
+    ``characters`` must already be sorted by x1.  A character rejected for
+    being under CHARACTER_MODEL_MIN_CONF simply vanishes from the assembled
+    plate with no trace that anything was there -- so a systematically
+    under-confident glyph (for example two "9"s the model only ever proposes
+    at ~0.2 confidence) silently and consistently shortens the plate instead
+    of ever surfacing as a failed read.  A weak detection whose center falls
+    strictly between two characters we did accept is strong evidence a real
+    character was missed, since there is no reason for a stray background
+    shape to land exactly in the middle of the plate's own text.
+    """
+    for left, right in zip(characters, characters[1:]):
+        gap_left, gap_right = left[2], right[0]
+        if gap_right <= gap_left:
+            continue
+        for wx1, wx2 in weak_positions:
+            if gap_left < (wx1 + wx2) / 2 < gap_right:
+                return True
+    return False
+
+
 def recognize_thai_plate(crop):
     """Return plate text plus a non-authoritative province suggestion.
 
@@ -91,7 +156,7 @@ def recognize_thai_plate(crop):
     crop_h = crop.shape[0]
     split_y = crop_h * PLATE_LINE_SPLIT_RATIO
 
-    characters, provinces, raw_detections = [], [], []
+    characters, provinces, raw_detections, weak_positions = [], [], [], []
     for box in result.boxes:
         try:
             class_id = int(box.cls[0].item())
@@ -101,7 +166,10 @@ def recognize_thai_plate(crop):
             continue
         label = _label(model, class_id)
         raw_detections.append((label, round(confidence, 2)))
+        is_char_class = label.isdigit() or label in THAI_CHARACTER_MAP
         if confidence < CHARACTER_MODEL_MIN_CONF:
+            if is_char_class and confidence >= CHARACTER_GAP_MIN_CONF:
+                weak_positions.append((x1, x2))
             continue
         y_center = (y1 + y2) / 2
         # A registration character detected inside the province band (or a
@@ -109,7 +177,7 @@ def recognize_thai_plate(crop):
         # always the model firing on the wrong line's text.  Keep the two
         # bands separate the same way the EasyOCR fallback crop is split, so
         # a stray province letter can never be spliced into the plate text.
-        if label.isdigit() or label in THAI_CHARACTER_MAP:
+        if is_char_class:
             if y_center >= split_y:
                 continue
             characters.append((x1, y1, x2, y2, THAI_CHARACTER_MAP.get(label, label), confidence))
@@ -118,16 +186,27 @@ def recognize_thai_plate(crop):
                 continue
             provinces.append((confidence, label))
 
+    characters, dropped_ambiguous = _resolve_overlapping_characters(characters)
+
     # Registration characters are ordered horizontally.  Province classes are
     # separate whole-line detections and never contribute to the plate text.
     characters.sort(key=lambda item: item[0])
     plate = "".join(item[4] for item in characters)
     confidence = sum(item[5] for item in characters) / len(characters) if characters else 0.0
     province_confidence, province_code = max(provinces, default=(0.0, ""), key=lambda item: item[0])
-    if not is_plausible_plate_text(plate):
+    incomplete = _has_internal_gap(characters, weak_positions)
+    if not is_plausible_plate_text(plate) or incomplete:
         plate, confidence = "", 0.0
 
     if DEBUG_THAI_PLATE:
+        if dropped_ambiguous:
+            ambiguous_str = [
+                [(item[4], round(item[5], 2)) for item in group]
+                for group in dropped_ambiguous
+            ]
+            print(f"[THAI-PLATE] ambiguous positions dropped: {ambiguous_str}", flush=True)
+        if incomplete:
+            print(f"[THAI-PLATE] discarded as incomplete: a weak detection sits between accepted characters", flush=True)
         print(
             f"[THAI-PLATE] raw={raw_detections} plate={plate or '<invalid>'} "
             f"conf={confidence:.2f} province={province_code or '<none>'}",

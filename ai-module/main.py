@@ -1,6 +1,14 @@
 import os
 
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+# TCP blocks and waits for retransmission on any lost packet -- fine on a
+# solid link, but per-stage timing measurements showed camera reads (not any
+# AI processing) causing every FPS dip, up to several seconds each.  UDP
+# just drops/corrupts the affected frame instead of blocking -- an
+# occasional glitchy frame is a much better failure mode here than freezing
+# the app, especially since the pipeline already discards low-confidence/
+# implausible reads regardless.  Revert to "rtsp_transport;tcp" if corrupted
+# frames prove more disruptive than the stalls were.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
 
 import cv2
 import queue
@@ -14,12 +22,12 @@ from color_classification import estimate_vehicle_color_with_confidence
 from config import (
     CAMERA_INDEX, COLOR_MIN_CONF, COLOR_MODEL_MIN_INTERVAL_SEC, COLOR_REQUIRED_HITS, DEBUG_COLOR, DEBUG_OCR_SAVE_INPUTS,
     DEBUG_OCR_VERBOSE, DETECTION_ROI, DISPLAY_SCALE, DRAW_DETECTION_ROIS,
-    ENABLE_MAKE_MODEL, EXIT_AFTER_SEC, EXIT_ARM_Y, EXIT_CROSS_Y,
+    CAMERA_RECONNECT_DELAY_SEC, DETECTED_GRACE_SEC, ENABLE_MAKE_MODEL, EXIT_AFTER_SEC, EXIT_ARM_Y, EXIT_CROSS_Y,
     EXIT_MIN_TRACK_FRAMES, EXIT_TRACK_ROI, FRAME_H, FRAME_W,
-    MAKE_MODEL_MIN_CONF, MIN_PLATE_AREA_PIXELS, MIN_PLATE_AREA_RATIO,
+    MAKE_MODEL_MIN_CONF, MAKE_MODEL_MIN_INTERVAL_SEC, MIN_PLATE_AREA_PIXELS, MIN_PLATE_AREA_RATIO,
     MIN_PLATE_BOX_H, MIN_PLATE_BOX_W, OCR_MIN_CONF, PLATE_LINE_SPLIT_RATIO, PLATE_NUMBER_ALLOWLIST,
     OCR_DRAIN_GRACE_SEC, OCR_MAX_JOBS_PER_TRACK, PLATE_CHANGE_MIN_CONF_GAIN,
-    PLATE_TRACKER_CANDIDATES, PROVINCE_ALLOWLIST, TRACK_DISPLAY_MAX_AGE_SEC,
+    PLATE_TRACKER_CANDIDATES, PROVINCE_ALLOWLIST, SINGLE_READ_PROMOTION_MIN_CONF, TRACK_DISPLAY_MAX_AGE_SEC,
     TRACK_REASSOCIATE_IOU, VEHICLE_TRACK_GAP_SEC,
     VEHICLE_ENTRY_ROI, YOLO_EVERY_N, YOLO_VEHICLE_MIN_CONF, ENABLE_PROVINCE_OCR,
 )
@@ -38,6 +46,15 @@ from vehicle_detector import find_vehicle_tracks
 
 # Every OCR job carries the owning ByteTrack ID, preventing cross-car updates.
 ocr_queue = queue.Queue(maxsize=8)
+# Colour and make/model both used to run as direct GPU calls inside the main
+# video-loop thread, gated only by a throttle interval + "OCR not busy right
+# now" check.  Whenever that interval elapsed for one or more currently
+# visible vehicles, the main loop blocked on those calls before it could
+# read the next camera frame -- a periodic FPS dip independent of which
+# model was loaded, since it was a threading issue, not a model-quality
+# one.  Both now run on their own background thread instead, exactly like
+# OCR already does.
+attributes_queue = queue.Queue(maxsize=16)
 backend_queue = queue.Queue(maxsize=16)
 sessions_lock = threading.Lock()
 vehicle_sessions = {}
@@ -55,10 +72,14 @@ def _new_session(track_id, now):
         "province_stabilizer": PlateStabilizer(5, 1, 8, 1.0),
         "make_model_stabilizer": MakeModelStabilizer(5, 2, 8),
         "plate": "", "province": "", "plate_conf": 0.0,
+        "plate_hits": 0, "detected_logged": False, "detected_ready_at": None,
+        "provisional_plate": "", "provisional_province": "", "provisional_conf": 0.0,
+        "provisional_logged": False,
         "color": "unknown", "color_conf": 0.0,
-        "color_scores": {}, "color_counts": {},
-        "last_color_debug": None, "last_color_attempt": 0.0,
-        "make": "unknown", "model": "unknown", "mm_conf": 0.0,
+        "color_scores": {}, "color_counts": {}, "color_logged": False,
+        "last_color_debug": None, "last_color_attempt": 0.0, "color_job_pending": False,
+        "make": "unknown", "model": "unknown", "mm_conf": 0.0, "last_make_attempt": 0.0,
+        "make_logged": False, "make_job_pending": False,
         "box": None, "plate_box": None, "last_seen": now, "frames": 0,
         "exit_armed": False, "exit_crossed": False,
         "entry_sent": False, "exit_sent": False,
@@ -151,21 +172,46 @@ def _is_in_station_driveway(vehicle):
 
 
 def _queue_entry_if_ready(session):
-    """An entry is sent once, only when this same car has plate and colour."""
-    if session["entry_sent"] or not session["plate"] or session["color_conf"] < COLOR_MIN_CONF:
+    """An entry is sent once colour is confident. Plate is intentionally not
+    required here -- this camera's entry view usually doesn't show it at
+    all, so the backend instead matches this entry to its eventual exit by
+    colour/make. Skip a session that is already armed to exit: a vehicle
+    re-tracked under a new ID while actually leaving would otherwise also
+    pass the colour check and be logged as a second, bogus entry for a
+    vehicle that is already inside."""
+    if (
+        session["entry_sent"]
+        or session["color_conf"] < COLOR_MIN_CONF
+        or session["exit_armed"]
+    ):
         return
     try:
-        backend_queue.put_nowait({"type": "entry", "event_id": str(uuid.uuid4()), "track_id": session["id"], "plate": session["plate"], "conf": session["plate_conf"], "color": session["color"]})
+        backend_queue.put_nowait({
+            "type": "entry", "event_id": str(uuid.uuid4()), "track_id": session["id"],
+            "plate": session["plate"], "conf": session["plate_conf"],
+            "color": session["color"], "make": session["make"],
+        })
         session["entry_sent"] = True
     except queue.Full:
         pass
 
 
 def _queue_exit_if_needed(session, reason):
-    if not session["entry_sent"] or session["exit_sent"] or not session["plate"]:
+    """An exit is sent once this session has a plate, regardless of whether
+    this same session ever sent its own entry. A vehicle that entered
+    off-camera-view of the plate (see _queue_entry_if_ready) and is only
+    re-tracked once it reaches the exit corridor never has entry_sent=True
+    locally -- the backend still matches it to its real, earlier entry by
+    colour/make, so this session does not need to have "seen" that entry
+    itself."""
+    if session["exit_sent"] or not session["plate"]:
         return
     try:
-        backend_queue.put_nowait({"type": "exit", "event_id": str(uuid.uuid4()), "track_id": session["id"], "plate": session["plate"], "reason": reason})
+        backend_queue.put_nowait({
+            "type": "exit", "event_id": str(uuid.uuid4()), "track_id": session["id"],
+            "plate": session["plate"], "color": session["color"], "make": session["make"],
+            "reason": reason,
+        })
         session["exit_sent"] = True
     except queue.Full:
         pass
@@ -177,6 +223,147 @@ def _has_pending_ocr_work():
         return any(session["ocr_jobs_pending"] > 0 for session in vehicle_sessions.values())
 
 
+def _build_detected_message(session, track_id):
+    return (
+        f"[DETECTED] track={track_id} plate={session['plate']} "
+        f"province={session['province']} conf={session['plate_conf']:.2f} "
+        f"hits={session['plate_hits']} color={session['color']} "
+        f"color_conf={session['color_conf']:.2f} make={session['make']} "
+        f"mm_conf={session['mm_conf']:.2f}"
+    )
+
+
+def _mark_detected_ready(session, now):
+    """Record the moment plate+colour both first became available.
+
+    The [DETECTED] print itself is deferred (see _detected_message_if_ready)
+    rather than fired here, so a make/model result that resolves moments
+    later on its own throttled schedule has a bounded chance to land in the
+    same summary line instead of that line always showing "unknown".  This
+    never delays the backend entry event -- _queue_entry_if_ready already
+    fires independently of this bookkeeping.
+    """
+    if (
+        session["detected_ready_at"] is None
+        and session["plate"]
+        and session["color_conf"] >= COLOR_MIN_CONF
+    ):
+        session["detected_ready_at"] = now
+
+
+def _detected_message_if_ready(session, track_id, now):
+    """Return the [DETECTED] line once ready, holding it for up to
+    DETECTED_GRACE_SEC to give make/model a chance to resolve first.  Must be
+    called while holding sessions_lock."""
+    if session["detected_logged"] or session["detected_ready_at"] is None:
+        return None
+    make_resolved = session["mm_conf"] >= MAKE_MODEL_MIN_CONF
+    grace_elapsed = now - session["detected_ready_at"] >= DETECTED_GRACE_SEC
+    if not (make_resolved or grace_elapsed):
+        return None
+    session["detected_logged"] = True
+    return _build_detected_message(session, track_id)
+
+
+def _apply_color_result(session, track_id, color, color_conf, now):
+    """Fold one colour attempt's result into the session.  Must be called
+    while holding sessions_lock.  Returns any message(s) to print, or None."""
+    if color_conf < COLOR_MIN_CONF:
+        return None
+    session["color_scores"][color] = session["color_scores"].get(color, 0.0) + color_conf
+    session["color_counts"][color] = session["color_counts"].get(color, 0) + 1
+    best = max(session["color_scores"], key=session["color_scores"].get)
+    if session["color_counts"][best] < COLOR_REQUIRED_HITS:
+        return None
+    session["color"] = best
+    session["color_conf"] = session["color_scores"][best] / session["color_counts"][best]
+    _queue_entry_if_ready(session)
+    message = None
+    if not session["color_logged"]:
+        session["color_logged"] = True
+        message = (
+            f"[COLOR] track={track_id} color={best} "
+            f"color_conf={session['color_conf']:.2f} "
+            f"plate={session['plate'] or '<pending>'}"
+        )
+    _mark_detected_ready(session, now)
+    if DEBUG_COLOR and session["last_color_debug"] != best:
+        session["last_color_debug"] = best
+        debug_message = f"[VEHICLE] track={track_id} color={best} conf={session['color_conf']:.2f}"
+        message = f"{message}\n{debug_message}" if message else debug_message
+    return message
+
+
+def _apply_make_result(session, track_id, make, mm_model, mm_conf, now):
+    """Fold one make/model attempt's result into the session.  Must be
+    called while holding sessions_lock.  Returns a message to print, or
+    None."""
+    if mm_conf < MAKE_MODEL_MIN_CONF:
+        return None
+    result = session["make_model_stabilizer"].offer(make, mm_model, mm_conf, now)
+    if not result:
+        return None
+    session["make"], session["model"], session["mm_conf"] = result["make"], result["model"], result["conf"]
+    if session["make_logged"]:
+        return None
+    session["make_logged"] = True
+    return f"[MAKE] track={track_id} make={session['make']} mm_conf={session['mm_conf']:.2f} hits={result['hits']}"
+
+
+def attributes_worker():
+    """Run colour and make/model inference off the main video-loop thread.
+
+    Both used to run as direct synchronous GPU calls inside
+    _update_vehicle_session; this drains a queue of {type, track_id, crop}
+    jobs instead, so the main loop only ever has to enqueue (cheap) rather
+    than wait for a classifier forward pass before it can read the next
+    frame.
+    """
+    while not stop_flag:
+        try:
+            job = attributes_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        track_id, crop, job_type = job["track_id"], job["crop"], job["type"]
+        pending_key = "color_job_pending" if job_type == "color" else "make_job_pending"
+        try:
+            if crop is None or crop.size == 0:
+                continue
+            # OCR priority can still matter by the time this job is actually
+            # popped, even though the caller checked it before enqueueing.
+            if _has_pending_ocr_work():
+                continue
+            now = time.time()
+            message = None
+            if job_type == "color":
+                try:
+                    color, color_conf = estimate_vehicle_color_with_confidence(crop)
+                except Exception as error:
+                    color, color_conf = "unknown", 0.0
+                    print(f"[COLOR] track={track_id} skipped: {error}", flush=True)
+                with sessions_lock:
+                    session = vehicle_sessions.get(_current_session_id(track_id))
+                    if session is not None:
+                        message = _apply_color_result(session, track_id, color, color_conf, now)
+            else:
+                try:
+                    make, mm_model, mm_conf = infer_make_model(crop, track_id=track_id)
+                except Exception as error:
+                    make, mm_model, mm_conf = "unknown", "unknown", 0.0
+                    print(f"[MAKE] track={track_id} skipped: {error}", flush=True)
+                with sessions_lock:
+                    session = vehicle_sessions.get(_current_session_id(track_id))
+                    if session is not None:
+                        message = _apply_make_result(session, track_id, make, mm_model, mm_conf, now)
+            if message:
+                print(message, flush=True)
+        finally:
+            with sessions_lock:
+                session = vehicle_sessions.get(_current_session_id(track_id))
+                if session is not None:
+                    session[pending_key] = False
+
+
 def backend_worker():
     while not stop_flag:
         try:
@@ -184,11 +371,11 @@ def backend_worker():
         except queue.Empty:
             continue
         if job["type"] == "entry":
-            response = send_detection(job["event_id"], job["plate"], job["conf"], job["color"])
+            response = send_detection(job["event_id"], job["plate"], job["conf"], job["color"], job["make"])
             if response:
                 tag = "NEW" if response.get("is_new_visit") else "seen again"
-                print(f"[{tag}] track={job['track_id']} plate={job['plate']} color={job['color']}", flush=True)
-        elif job["type"] == "exit" and send_exit(job["event_id"], job["plate"]):
+                print(f"[{tag}] track={job['track_id']} plate={job['plate'] or '<none yet>'} color={job['color']}", flush=True)
+        elif job["type"] == "exit" and send_exit(job["event_id"], job["plate"], job["color"], job["make"]):
             print(f"[EXIT] track={job['track_id']} plate={job['plate']} reason={job['reason']}", flush=True)
 
 
@@ -270,6 +457,16 @@ def ocr_worker():
                 if DEBUG_OCR_VERBOSE:
                     print(f"[OCR] track={track_id} rejected text={plate!r} conf={conf:.2f}", flush=True)
                 continue
+            if (
+                conf > session["provisional_conf"]
+                or (
+                    conf == session["provisional_conf"]
+                    and len(plate) > len(session["provisional_plate"])
+                )
+            ):
+                session["provisional_plate"] = plate
+                session["provisional_province"] = province
+                session["provisional_conf"] = conf
             stable = session["plate_stabilizer"].offer(plate, conf, province, now)
             if stable is None:
                 if DEBUG_OCR_VERBOSE:
@@ -296,8 +493,9 @@ def ocr_worker():
                     )
                 continue
             session["plate"], session["province"], session["plate_conf"] = stable["text"], stable["province"], stable["conf"]
+            session["plate_hits"] = stable["hits"]
             _queue_entry_if_ready(session)
-            print(f"[DETECTED] track={track_id} plate={session['plate']} province={session['province']} conf={session['plate_conf']:.2f} hits={stable['hits']} color={session['color']} color_conf={session['color_conf']:.2f}", flush=True)
+            _mark_detected_ready(session, now)
 
 
 def _update_vehicle_session(vehicle, frame, now):
@@ -312,55 +510,65 @@ def _update_vehicle_session(vehicle, frame, now):
     crop = frame[max(0, vy):min(frame.shape[0], vy + vh), max(0, vx):min(frame.shape[1], vx + vw)]
     if crop.size == 0:
         return
-    # Colour is auxiliary metadata.  Do not spend GPU time on it until this
-    # vehicle has completed a plate-OCR attempt, and yield whenever any OCR
-    # job is queued or running.  This preserves plate/OCR priority without
-    # hiding colour for a vehicle whose plate text could not be read.
-    color, color_conf = "unknown", 0.0
+    # Colour and make/model are auxiliary metadata, handled identically:
+    # each is enqueued for the background attributes_worker thread rather
+    # than run inline here, so a classifier forward pass can never block
+    # this frame's read of the next camera frame -- only cheap bookkeeping
+    # (throttle/stability checks, an enqueue) happens in this thread. Never
+    # queue while an OCR job is active elsewhere (that GPU time stays
+    # reserved for plate/OCR), no more than once per interval, and never a
+    # second job for the same vehicle while one is already in flight. This
+    # no longer waits for this vehicle's entire first OCR attempt to finish
+    # first -- a fast vehicle can leave before that attempt (tracker
+    # collection + queueing + the OCR thread itself) ever completes, and
+    # previously meant colour, make, and therefore the backend entry event
+    # never ran at all.
+    # _has_pending_ocr_work() takes sessions_lock itself, so it must be
+    # called before entering the lock below -- threading.Lock is not
+    # reentrant, and nesting this call inside an already-held lock would
+    # deadlock the main video-loop thread the first time a colour/make job
+    # became eligible to enqueue.
+    ocr_busy = _has_pending_ocr_work()
     with sessions_lock:
-        plate_ocr_completed = (
-            session["ocr_jobs_submitted"] > 0
-            and session["ocr_jobs_pending"] == 0
-        )
         color_is_stable = session["color_conf"] >= COLOR_MIN_CONF
         color_due = now - session["last_color_attempt"] >= COLOR_MODEL_MIN_INTERVAL_SEC
-    if (
-        plate_ocr_completed
-        and not color_is_stable
-        and not _has_pending_ocr_work()
-        and color_due
-    ):
-        with sessions_lock:
+        make_is_stable = session["mm_conf"] >= MAKE_MODEL_MIN_CONF
+        make_due = now - session["last_make_attempt"] >= MAKE_MODEL_MIN_INTERVAL_SEC
+        if (
+            not color_is_stable
+            and not session["color_job_pending"]
+            and color_due
+            and not ocr_busy
+        ):
             session["last_color_attempt"] = now
-        try:
-            color, color_conf = estimate_vehicle_color_with_confidence(crop)
-        except Exception as error:
-            color, color_conf = "unknown", 0.0
-            print(f"[COLOR] track={track_id} skipped: {error}", flush=True)
+            session["color_job_pending"] = True
+            try:
+                attributes_queue.put_nowait({"type": "color", "track_id": track_id, "crop": crop.copy()})
+            except queue.Full:
+                session["color_job_pending"] = False
+        if (
+            ENABLE_MAKE_MODEL
+            and not make_is_stable
+            and not session["make_job_pending"]
+            and make_due
+            and not ocr_busy
+        ):
+            session["last_make_attempt"] = now
+            session["make_job_pending"] = True
+            try:
+                attributes_queue.put_nowait({"type": "make", "track_id": track_id, "crop": crop.copy()})
+            except queue.Full:
+                session["make_job_pending"] = False
+
     ex1, ey1, ex2, ey2 = EXIT_TRACK_ROI
     in_exit_track_roi = ex1 <= center_x <= ex2 and ey1 <= center_y <= ey2
-    color_debug_message = None
+    detected_message = None
     with sessions_lock:
-        if color_conf >= COLOR_MIN_CONF:
-            session["color_scores"][color] = session["color_scores"].get(color, 0.0) + color_conf
-            session["color_counts"][color] = session["color_counts"].get(color, 0) + 1
-            best = max(session["color_scores"], key=session["color_scores"].get)
-            if session["color_counts"][best] >= COLOR_REQUIRED_HITS:
-                session["color"] = best
-                session["color_conf"] = session["color_scores"][best] / session["color_counts"][best]
-                _queue_entry_if_ready(session)
-                if DEBUG_COLOR and session["last_color_debug"] != best:
-                    session["last_color_debug"] = best
-                    color_debug_message = (
-                        f"[VEHICLE] track={track_id} color={best} "
-                        f"conf={session['color_conf']:.2f}"
-                    )
-        if ENABLE_MAKE_MODEL:
-            make, model, mm_conf = infer_make_model(crop)
-            if mm_conf >= MAKE_MODEL_MIN_CONF:
-                result = session["make_model_stabilizer"].offer(make, model, mm_conf, now)
-                if result:
-                    session["make"], session["model"], session["mm_conf"] = result["make"], result["model"], result["conf"]
+        # Checked every frame this vehicle is visible, regardless of whether
+        # colour or make/model changed just now -- this is what lets the
+        # deferred [DETECTED] print fire either as soon as make resolves or
+        # once DETECTED_GRACE_SEC has elapsed, whichever comes first.
+        detected_message = _detected_message_if_ready(session, track_id, now)
         if in_exit_track_roi and center_y >= EXIT_ARM_Y:
             session["exit_armed"] = True
         crossed = in_exit_track_roi and session["exit_armed"] and not session["exit_crossed"] and session["frames"] >= EXIT_MIN_TRACK_FRAMES and center_y <= EXIT_CROSS_Y
@@ -369,8 +577,8 @@ def _update_vehicle_session(vehicle, frame, now):
             _queue_entry_if_ready(session)
             _queue_exit_if_needed(session, "crossed_exit_line")
             print(f"[EXIT-VEHICLE] track={track_id} color={session['color']} confidence={session['color_conf']:.2f} frames={session['frames']}", flush=True)
-    if color_debug_message:
-        print(color_debug_message, flush=True)
+    if detected_message:
+        print(detected_message, flush=True)
 
 
 def _retire_missing_sessions(now):
@@ -386,23 +594,80 @@ def _retire_missing_sessions(now):
             )
         ]
         for track_id in stale_ids:
-            _queue_exit_if_needed(vehicle_sessions[track_id], "track_disappeared")
+            session = vehicle_sessions[track_id]
+            if (
+                not session["plate"]
+                and session["provisional_plate"]
+                and session["provisional_conf"] >= SINGLE_READ_PROMOTION_MIN_CONF
+            ):
+                # This vehicle is leaving before the stabilizer collected its
+                # normal second confirming read -- typically a fast-moving
+                # car. Without this, it would leave with zero backend record
+                # at all: _queue_entry_if_ready only ever fires on a
+                # confirmed session["plate"]. Only promote a lone read this
+                # well above OCR_MIN_CONF, since it never gets the usual
+                # protection of a second agreeing read.
+                session["plate"] = session["provisional_plate"]
+                session["province"] = session["provisional_province"]
+                session["plate_conf"] = session["provisional_conf"]
+                session["plate_hits"] = max(session["plate_hits"], 1)
+                session["provisional_logged"] = True
+                print(
+                    f"[SINGLE-READ] track={track_id} plate={session['plate']} "
+                    f"province={session['province']} conf={session['plate_conf']:.2f} "
+                    "promoted without a second confirming read",
+                    flush=True,
+                )
+                _queue_entry_if_ready(session)
+                _mark_detected_ready(session, now)
+            if not session["detected_logged"] and session["detected_ready_at"] is not None:
+                # Plate+colour were ready but the vehicle is leaving before
+                # DETECTED_GRACE_SEC elapsed or make/model resolved -- this
+                # is the last chance to print, so do it now with whatever
+                # make value (possibly still "unknown") is available.
+                session["detected_logged"] = True
+                print(_build_detected_message(session, track_id), flush=True)
+            elif (
+                not session["detected_logged"]
+                and not session["provisional_logged"]
+                and session["provisional_plate"]
+            ):
+                # No longer gated on having exhausted every OCR attempt --
+                # a fast vehicle can retire long before OCR_MAX_JOBS_PER_TRACK
+                # jobs ever get submitted, and previously left with no trace
+                # at all in that case.
+                session["provisional_logged"] = True
+                print(
+                    f"[PROVISIONAL] track={track_id} "
+                    f"plate={session['provisional_plate']} "
+                    f"province={session['provisional_province']} "
+                    f"conf={session['provisional_conf']:.2f} "
+                    f"color={session['color']} color_conf={session['color_conf']:.2f}",
+                    flush=True,
+                )
+            _queue_exit_if_needed(session, "track_disappeared")
             del vehicle_sessions[track_id]
         for old_track_id in list(session_aliases):
             if _current_session_id(old_track_id) not in vehicle_sessions:
                 del session_aliases[old_track_id]
 
 
-def run_live():
-    global stop_flag
+def _open_capture():
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def run_live():
+    global stop_flag
+    cap = _open_capture()
     if not cap.isOpened():
         print(f"Cannot open camera: {CAMERA_INDEX}")
         return
     cv2.namedWindow("Gas Station LPR", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Gas Station LPR", int(FRAME_W * DISPLAY_SCALE), int(FRAME_H * DISPLAY_SCALE))
     threading.Thread(target=ocr_worker, daemon=True).start()
+    threading.Thread(target=attributes_worker, daemon=True).start()
     threading.Thread(target=backend_worker, daemon=True).start()
     frame_count, fps_count, fps, last_fps_at, last_plate_box = 0, 0, 0.0, time.time(), None
     print("Live detection started. Press 'q' to quit | 's' to screenshot", flush=True)
@@ -410,8 +675,20 @@ def run_live():
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Lost camera feed.", flush=True)
-            break
+            print("Lost camera feed, attempting to reconnect...", flush=True)
+            cap.release()
+            attempt = 0
+            while not stop_flag:
+                attempt += 1
+                time.sleep(CAMERA_RECONNECT_DELAY_SEC)
+                cap = _open_capture()
+                if cap.isOpened():
+                    print(f"Reconnected after {attempt} attempt(s).", flush=True)
+                    break
+                print(f"Reconnect attempt {attempt} failed, retrying...", flush=True)
+            if stop_flag:
+                break
+            continue
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         frame_count, fps_count, now = frame_count + 1, fps_count + 1, time.time()
         if now - last_fps_at >= 1:
@@ -436,6 +713,11 @@ def run_live():
                 if _plate_vehicle_match(candidate_box, vehicles):
                     box, box_conf = candidate_box, candidate_conf
                     break
+        # Reset every frame rather than only on a new valid detection -- otherwise
+        # the green box drawn below keeps showing wherever the last valid plate
+        # was, even after that vehicle has left or the plate is no longer found,
+        # which looks like a wrong/stale detection on the current vehicle.
+        last_plate_box = None
         if box:
             x, y, w, h = box
             roi_area = max(1, (DETECTION_ROI[2] - DETECTION_ROI[0]) * (DETECTION_ROI[3] - DETECTION_ROI[1]))

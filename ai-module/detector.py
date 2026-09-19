@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from config import CONF_THRESHOLD, ENABLE_PLATE_FALLBACK, MODEL_PATH
+from config import CONF_THRESHOLD, ENABLE_PLATE_FALLBACK, MODEL_PATH, PLATE_MODEL_IMGSZ
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -56,7 +56,7 @@ def _red_plate_fallback(frame):
 
 def find_plate_yolo_candidates(frame):
     """Return plate candidates ordered from highest to lowest confidence."""
-    results = plate_model(frame, conf=CONF_THRESHOLD, iou=0.45, verbose=False)[0]
+    results = plate_model(frame, conf=CONF_THRESHOLD, iou=0.45, imgsz=PLATE_MODEL_IMGSZ, verbose=False)[0]
     candidates = []
     h, w = frame.shape[:2]
 

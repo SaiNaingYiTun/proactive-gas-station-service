@@ -51,7 +51,11 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
             continue
 
         label = vehicle_model.names[cls]
-        if label.lower() not in {"car", "truck", "bus", "motorcycle"}:
+        # Motorcycles are excluded: this station's plate/colour/make pipeline
+        # is built for four-wheeled vehicles, and a motorcycle's rear view
+        # rarely has a legible full plate in the same position, wasting a
+        # tracked session and OCR attempts on a vehicle type it can't serve.
+        if label.lower() not in {"car", "truck", "bus"}:
             continue
 
         width = x2 - x1
@@ -114,7 +118,11 @@ def find_vehicle_tracks(frame, min_conf=0.30):
         except (TypeError, ValueError):
             continue
 
-        if vehicle_model.names[cls].lower() not in {"car", "truck", "bus", "motorcycle"}:
+        # Motorcycles are excluded: this station's plate/colour/make pipeline
+        # is built for four-wheeled vehicles, and a motorcycle's rear view
+        # rarely has a legible full plate in the same position, wasting a
+        # tracked session and OCR attempts on a vehicle type it can't serve.
+        if vehicle_model.names[cls].lower() not in {"car", "truck", "bus"}:
             continue
         width, height = x2 - x1, y2 - y1
         if width <= 0 or height <= 0 or width * height < w * h * 0.002:
