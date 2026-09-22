@@ -6,7 +6,7 @@
 // expires. localStorage (not sessionStorage) so a login survives closing the
 // browser tab, matching how the desktop app remembers its own settings.
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? (import.meta.env.PROD ? '' : 'http://localhost:8000')
 const STORAGE_KEY = 'gas-station-session'
 
 function readSession() {
