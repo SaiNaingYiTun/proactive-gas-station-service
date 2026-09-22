@@ -8,7 +8,7 @@ CAMERA_ID = 1
 
 CAMERA_INDEX = os.environ.get(
     "CAMERA_RTSP_URL",
-    "rtsp://admin:seniorproject2!@192.168.1.209:554/Streaming/Channels/101"
+    "rtsp://user:password@192.168.1.209:554/Streaming/Channels/101"
 )
 # A stream drop previously just crashed the whole process (a transient
 # network/camera hiccup then required a manual restart).  Keep retrying at
@@ -53,6 +53,23 @@ DETECTION_ROI = (
 # Only create vehicle sessions after a car has entered the station driveway.
 # This excludes public-road traffic visible across the upper part of the frame.
 VEHICLE_ENTRY_ROI = (50, 400, 1300, 800)
+# The road this camera watches is toward the TOP of frame and the station is
+# toward the BOTTOM, so a vehicle's box position the first time its session
+# is created is a real, usable signal for which direction it's moving: one
+# arriving from the road crosses into VEHICLE_ENTRY_ROI right at its top
+# edge, while one already inside (parked, now leaving) is first (re)tracked
+# well below that -- its earlier entry session has almost always already
+# been retired (see VEHICLE_TRACK_GAP_SEC) by the time it starts moving
+# again minutes later, so this "first box position" is a fresh reading, not
+# a stale one left over from when it entered. Direction matters because the
+# two kinds of traffic get framed differently over time: entering vehicles
+# get WORSE framed the longer they're waited on (they approach the camera
+# and eventually get too close/edge-clipped -- see VEHICLE_FRAME_EDGE_MARGIN
+# below); exiting vehicles move away from that same close-in zone, so they
+# get BETTER framed with time. The ROI's own vertical midpoint is a
+# reasonable starting guess for the split, not a measured value -- retune it
+# if real traffic splits somewhere else on this camera.
+ENTRY_DIRECTION_SPLIT_Y = (VEHICLE_ENTRY_ROI[1] + VEHICLE_ENTRY_ROI[3]) // 2
 DRAW_DETECTION_ROIS = True
 
 # =============================
@@ -106,7 +123,7 @@ CONF_THRESHOLD = 0.60
 # letterboxes down to imgsz before inference.  At the default 640 a 50px-wide
 # plate (a car still a few metres out, or one turning its rear to the camera)
 # shrinks to ~25px and its confidence falls under CONF_THRESHOLD -- on this
-# camera's saved frames 640 missed the plate in 7 of 13 screenshots, 960 in 1.
+# camera's saved frames 640 missed the plate in 6 of 13 screenshots, 960 in 1.
 PLATE_MODEL_IMGSZ = 960
 # The colour/contour fallback is intentionally disabled for live OCR.  On this
 # camera it mistakes white car bodywork and road markings for plates, which
@@ -212,11 +229,39 @@ BRAND_MODEL_PATH = "brand.pt"
 # same way so a real classifier call can never compete with plate OCR for
 # the GPU or stall the main video-loop thread every frame.
 MAKE_MODEL_MIN_INTERVAL_SEC = 0.75
+# How long an EXITING vehicle's colour/make attempt waits for a legible
+# plate before giving up and guessing from whatever crop is available (see
+# _attribute_ready in main.py, and ENTRY_DIRECTION_SPLIT_Y above for why
+# entering traffic does not wait at all). A detected plate-shaped box on
+# this vehicle (session["plate_box"]) is the same "this is genuinely a
+# legible view" signal the OCR pipeline already requires, so colour/make
+# leans on it too rather than firing on whatever crop happens to be
+# available first -- firing immediately let two agreeing (wrong) reads,
+# just 2*MAKE_MODEL_MIN_INTERVAL_SEC apart, lock the stabilizer in before
+# the vehicle ever reached a clean view. Not every vehicle's plate gets a
+# box at all (glare, occlusion, an angle the detector misses) --
+# ATTRIBUTE_FALLBACK_SEC caps that wait so a hard case still gets one
+# best-effort guess before it leaves, rather than sitting at "unknown"
+# forever.
+ATTRIBUTE_FALLBACK_SEC = 3.0
+# A YOLO box only ever bounds the VISIBLE part of an object.  When a vehicle
+# is close enough to the camera that part of it extends past the frame edge,
+# the box is clipped exactly at that edge, and the crop built from it is a
+# fragment -- a door panel, a taillight -- not a usable whole-vehicle view.
+# This is a different failure from the plate_box wait above (that one caught
+# a vehicle still turning into the driveway, fully visible but at the wrong
+# angle; this one catches a vehicle that IS at a fine angle but is simply too
+# close for its whole body to fit in frame) -- real examples of both showed
+# up on this camera, so both checks are needed together, not one instead of
+# the other. This margin is pixels in the 1500x890 processing frame, not a
+# fraction of the vehicle's own box, since a frame edge is a fixed boundary
+# regardless of how large or small the vehicle in front of it is.
+VEHICLE_FRAME_EDGE_MARGIN = 15
 # brand.pt is the fine-tuned model from ai-module/brand_dataset (11 classes,
 # trained entirely on this station's own camera crops + condo phone photos
 # -- CompCars was deliberately removed from the training data this time; see
 # eval_brand_own_crops.py for the honest per-class accuracy this achieves --
-# 95.3% (82/86) at last check, and since val is now 100% real images rather
+# 93.9% (108/115) at last check, and since val is now 100% real images rather
 # than CompCars-diluted, that figure is directly trustworthy, not a
 # blended/inflated one). The previous CompCars-mixed fine-tune is preserved
 # at ai-module/brand.pt.finetuned; the original un-fine-tuned 161-class

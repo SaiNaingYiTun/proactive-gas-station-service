@@ -1,461 +1,271 @@
+import { useEffect, useState } from 'react'
+
 import {
-  Activity,
   CarFront,
-  ScanLine,
+  Clock3,
+  Palette,
+  ShieldAlert,
   TrendingUp,
-  Users,
 } from 'lucide-react'
 
-
-const trafficData = [
-  { day: 'Mon', value: 54 },
-  { day: 'Tue', value: 72 },
-  { day: 'Wed', value: 61 },
-  { day: 'Thu', value: 82 },
-  { day: 'Fri', value: 94 },
-  { day: 'Sat', value: 78 },
-  { day: 'Sun', value: 67 },
-]
+import { fetchAnalyticsSummary } from '../lib/api.js'
 
 
-const fuelData = [
-  {
-    name: 'Gasohol 95',
-    percent: 44,
-  },
-  {
-    name: 'Diesel',
-    percent: 29,
-  },
-  {
-    name: 'Gasohol 91',
-    percent: 18,
-  },
-  {
-    name: 'Premium',
-    percent: 9,
-  },
-]
-
-
-const frequencyData = [
-  {
-    label: 'Frequent',
-    description: '2+ visits per week',
-    value: 38,
-  },
-  {
-    label: 'Regular',
-    description: '1–3 visits per month',
-    value: 43,
-  },
-  {
-    label: 'Occasional',
-    description: 'Less than once per month',
-    value: 19,
-  },
-]
-
+// A small, brand-neutral palette cycled across bars/legend swatches --
+// there is no per-make or per-colour brand palette to draw from, so this
+// just needs to stay legible and consistent, not carry meaning per make.
+const SERIES_COLORS = ['#D98A32', '#5B8DBF', '#7FAE7A', '#B478B0', '#C4694F', '#6CA8A8']
 
 function Analytics() {
+  const [summary, setSummary] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [days, setDays] = useState(30)
+
+  useEffect(() => {
+    let cancelled = false
+
+    function load() {
+      // Reset to the loading state on every `days` change (not just on
+      // mount), so switching ranges shows a fresh load instead of the
+      // previous range's numbers sitting there stale while the new ones
+      // are fetched.
+      setLoading(true)
+      setError(null)
+      fetchAnalyticsSummary({ days })
+        .then((data) => { if (!cancelled) setSummary(data) })
+        .catch((err) => { if (!cancelled) setError(err.message) })
+        .finally(() => { if (!cancelled) setLoading(false) })
+    }
+
+    function onVisible() {
+      if (document.visibilityState === 'visible') load()
+    }
+
+    load()
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+
+    return () => {
+      cancelled = true
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+    }
+  }, [days])
+
+  const maxDaily = summary ? Math.max(1, ...summary.traffic_by_day.map((d) => d.count)) : 1
+
   return (
     <div className="mx-auto max-w-[1600px]">
 
       {/* HEADER */}
-      <div>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="h-px w-6 bg-[#D98A32]"></span>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#D98A32]">
+              Station Intelligence
+            </p>
+          </div>
 
-        <div className="flex items-center gap-2">
+          <h2 className="mt-3 text-3xl font-semibold tracking-[-0.035em] text-[#F5F6F7]">
+            Analytics
+          </h2>
 
-          <span className="h-px w-6 bg-[#D98A32]"></span>
-
-          <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#D98A32]">
-            Station Intelligence
+          <p className="mt-2 text-sm text-[#727A84]">
+            Real traffic, make/colour, and dwell time computed from recorded visits.
           </p>
-
         </div>
 
-
-        <h2 className="mt-3 text-3xl font-semibold tracking-[-0.035em] text-[#F5F6F7]">
-          Analytics
-        </h2>
-
-        <p className="mt-2 text-sm text-[#727A84]">
-          Traffic patterns, recognition activity and customer behavior.
-        </p>
-
+        <div className="flex gap-1 rounded-lg border border-[#252A30] bg-[#111419] p-1">
+          {[7, 30, 90].map((option) => (
+            <button
+              key={option}
+              type="button"
+              onClick={() => setDays(option)}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                days === option ? 'bg-[#D98A32] text-[#0B0D10]' : 'text-[#8B929B] hover:text-white'
+              }`}
+            >
+              {option}d
+            </button>
+          ))}
+        </div>
       </div>
 
+      {error && (
+        <p className="mt-6 rounded-lg border border-[#472F2F] bg-[#201414] px-4 py-3 text-sm text-[#D58A8A]">
+          Could not reach the backend: {error}
+        </p>
+      )}
 
       {/* KPI */}
       <div className="mt-8 grid gap-4 md:grid-cols-4">
-
+        <AnalyticsMetric icon={CarFront} label="Total Visits" value={loading ? '—' : summary.total_visits} />
         <AnalyticsMetric
-          icon={CarFront}
-          label="Vehicles Today"
-          value="48"
-          change="+12%"
-        />
-
-        <AnalyticsMetric
-          icon={Users}
-          label="Returning Customers"
-          value="31"
-          change="64.6%"
-        />
-
-        <AnalyticsMetric
-          icon={ScanLine}
-          label="Recognition Rate"
-          value="96.8%"
-          change="+1.4%"
+          icon={Clock3}
+          label="Avg. Dwell Time"
+          value={loading || summary.avg_dwell_minutes === null ? '—' : `${summary.avg_dwell_minutes}m`}
           accent
         />
-
         <AnalyticsMetric
-          icon={Activity}
-          label="Average Visits"
-          value="4.7"
-          change="+0.6"
+          icon={ShieldAlert}
+          label="Needs Review"
+          value={loading ? '—' : summary.needs_review}
         />
-
+        <AnalyticsMetric
+          icon={TrendingUp}
+          label="Days Covered"
+          value={loading ? '—' : days}
+        />
       </div>
-
 
       {/* MAIN CHARTS */}
       <div className="mt-6 grid gap-6 xl:grid-cols-12">
 
         {/* TRAFFIC */}
         <section className="rounded-2xl border border-[#252A30] bg-[#111419] p-6 xl:col-span-8">
-
-          <div className="flex items-start justify-between">
-
-            <div>
-
-              <h3 className="text-sm font-semibold text-[#ECEDEF]">
-                Vehicle Traffic
-              </h3>
-
-              <p className="mt-1.5 text-xs text-[#69717B]">
-                Vehicles detected over the last seven days
-              </p>
-
-            </div>
-
-
-            <div className="flex items-center gap-2">
-
-              <TrendingUp
-                size={15}
-                className="text-[#D98A32]"
-              />
-
-              <span className="text-xs font-semibold text-[#D98A32]">
-                +8.4%
-              </span>
-
-            </div>
-
-          </div>
-
-
-          <div className="mt-10 flex h-64 items-end gap-4 border-b border-[#292E34]">
-
-            {trafficData.map((item) => (
-
-              <div
-                key={item.day}
-                className="flex h-full flex-1 flex-col justify-end"
-              >
-
-                <div className="group relative flex flex-1 items-end justify-center">
-
-                  <div
-                    className="w-full max-w-14 rounded-t-md bg-gradient-to-t from-[#6F431C] to-[#D98A32] transition-all duration-300 group-hover:brightness-110"
-                    style={{
-                      height: `${item.value}%`,
-                    }}
-                  />
-
-
-                  <div className="absolute bottom-[calc(100%+8px)] hidden rounded-md border border-[#32373D] bg-[#171A1F] px-2 py-1 font-mono text-[10px] text-[#D5D8DB] group-hover:block">
-                    {item.value}
-                  </div>
-
-                </div>
-
-
-                <p className="py-3 text-center font-mono text-[10px] uppercase text-[#606872]">
-                  {item.day}
-                </p>
-
-              </div>
-
-            ))}
-
-          </div>
-
-        </section>
-
-
-        {/* FUEL */}
-        <section className="rounded-2xl border border-[#252A30] bg-[#111419] p-6 xl:col-span-4">
-
-          <h3 className="text-sm font-semibold text-[#ECEDEF]">
-            Fuel Preference
-          </h3>
-
+          <h3 className="text-sm font-semibold text-[#ECEDEF]">Vehicle Traffic</h3>
           <p className="mt-1.5 text-xs text-[#69717B]">
-            Most frequently selected fuel types
+            Entries recorded per day over the last {days} days
           </p>
 
+          {!loading && summary.traffic_by_day.length === 0 && (
+            <p className="mt-10 text-center text-sm text-[#5F6770]">No visits recorded in this range.</p>
+          )}
 
-          <div className="mt-8 space-y-6">
-
-            {fuelData.map((fuel) => (
-
-              <div key={fuel.name}>
-
-                <div className="flex items-center justify-between">
-
-                  <p className="text-xs text-[#9BA2AA]">
-                    {fuel.name}
-                  </p>
-
-                  <p className="font-mono text-xs font-semibold text-[#D7DADD]">
-                    {fuel.percent}%
-                  </p>
-
+          {!loading && summary.traffic_by_day.length > 0 && (
+            <div className="mt-10 flex h-64 items-end gap-1.5 overflow-x-auto border-b border-[#292E34] pb-0">
+              {summary.traffic_by_day.map((item) => (
+                <div key={item.date} className="flex h-full min-w-[10px] flex-1 flex-col justify-end">
+                  <div className="group relative flex flex-1 items-end justify-center">
+                    <div
+                      className="w-full max-w-14 rounded-t-md bg-gradient-to-t from-[#6F431C] to-[#D98A32] transition-all duration-300 group-hover:brightness-110"
+                      style={{ height: `${Math.max(2, (item.count / maxDaily) * 100)}%` }}
+                    />
+                    <div className="absolute bottom-[calc(100%+8px)] hidden whitespace-nowrap rounded-md border border-[#32373D] bg-[#171A1F] px-2 py-1 font-mono text-[10px] text-[#D5D8DB] group-hover:block">
+                      {item.date}: {item.count}
+                    </div>
+                  </div>
                 </div>
-
-
-                <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-[#22272D]">
-
-                  <div
-                    className="h-full rounded-full bg-[#D98A32]"
-                    style={{
-                      width: `${fuel.percent}%`,
-                    }}
-                  />
-
-                </div>
-
-              </div>
-
-            ))}
-
-          </div>
-
+              ))}
+            </div>
+          )}
         </section>
 
-      </div>
+        {/* MAKE BREAKDOWN */}
+        <section className="rounded-2xl border border-[#252A30] bg-[#111419] p-6 xl:col-span-4">
+          <h3 className="text-sm font-semibold text-[#ECEDEF]">Vehicle Make</h3>
+          <p className="mt-1.5 text-xs text-[#69717B]">
+            Recognised makes, "unknown" excluded
+          </p>
 
+          <BreakdownList
+            loading={loading}
+            items={summary?.by_make.map((row) => ({ label: row.make, count: row.count }))}
+            emptyText="No make classifications yet."
+          />
+        </section>
+      </div>
 
       {/* SECOND ROW */}
       <div className="mt-6 grid gap-6 xl:grid-cols-2">
 
-        {/* CUSTOMER FREQUENCY */}
+        {/* COLOUR BREAKDOWN */}
         <section className="rounded-2xl border border-[#252A30] bg-[#111419] p-6">
-
-          <h3 className="text-sm font-semibold text-[#ECEDEF]">
-            Customer Visit Frequency
-          </h3>
-
+          <div className="flex items-center gap-2">
+            <Palette size={15} className="text-[#D98A32]" />
+            <h3 className="text-sm font-semibold text-[#ECEDEF]">Vehicle Colour</h3>
+          </div>
           <p className="mt-1.5 text-xs text-[#69717B]">
-            Customer segments based on station visit frequency.
+            Recognised colours, "unknown" excluded
           </p>
 
-
-          <div className="mt-7 space-y-4">
-
-            {frequencyData.map((item) => (
-
-              <div
-                key={item.label}
-                className="rounded-xl border border-[#252A30] bg-[#0E1114] p-4"
-              >
-
-                <div className="flex items-center justify-between">
-
-                  <div>
-
-                    <p className="text-sm font-medium text-[#D5D8DB]">
-                      {item.label}
-                    </p>
-
-                    <p className="mt-1 text-[11px] text-[#626A74]">
-                      {item.description}
-                    </p>
-
-                  </div>
-
-
-                  <p className="font-mono text-xl font-semibold text-[#D98A32]">
-                    {item.value}%
-                  </p>
-
-                </div>
-
-              </div>
-
-            ))}
-
-          </div>
-
+          <BreakdownList
+            loading={loading}
+            items={summary?.by_color.map((row) => ({ label: row.color, count: row.count }))}
+            emptyText="No colour classifications yet."
+          />
         </section>
 
-
-        {/* SYSTEM PERFORMANCE */}
+        {/* DWELL TIME DETAIL */}
         <section className="rounded-2xl border border-[#252A30] bg-[#111419] p-6">
-
-          <h3 className="text-sm font-semibold text-[#ECEDEF]">
-            Recognition Performance
-          </h3>
-
+          <h3 className="text-sm font-semibold text-[#ECEDEF]">Dwell Time</h3>
           <p className="mt-1.5 text-xs text-[#69717B]">
-            Current AI detection and customer matching performance.
+            How long a completed visit spent between entry and exit
           </p>
 
-
-          <div className="mt-7">
-
-            <PerformanceRow
-              label="Vehicle Detection"
-              value="98.2%"
-              percent={98}
-            />
-
-            <PerformanceRow
-              label="License Plate Recognition"
-              value="96.8%"
-              percent={97}
-            />
-
-            <PerformanceRow
-              label="Customer Matching"
-              value="92.4%"
-              percent={92}
-            />
-
-            <PerformanceRow
-              label="Camera Availability"
-              value="100%"
-              percent={100}
-              healthy
-            />
-
-          </div>
-
+          {!loading && (
+            <div className="mt-7 space-y-5">
+              <StatRow label="Average" value={summary.avg_dwell_minutes === null ? 'No completed visits yet' : `${summary.avg_dwell_minutes} minutes`} />
+              <StatRow label="Completed visits with both entry and exit" value={summary.completed_with_dwell} />
+              <StatRow label="Total visits in range" value={summary.total_visits} />
+            </div>
+          )}
         </section>
-
       </div>
-
     </div>
   )
 }
 
 
-function AnalyticsMetric({
-  icon: Icon,
-  label,
-  value,
-  change,
-  accent,
-}) {
+function AnalyticsMetric({ icon: Icon, label, value, accent }) {
   return (
-    <div
-      className={`rounded-2xl border bg-[#111419] p-5 ${
-        accent
-          ? 'border-[#493824]'
-          : 'border-[#252A30]'
-      }`}
-    >
-
+    <div className={`rounded-2xl border bg-[#111419] p-5 ${accent ? 'border-[#493824]' : 'border-[#252A30]'}`}>
       <div className="flex items-start justify-between">
-
         <div>
-
-          <p className="text-xs text-[#747C85]">
-            {label}
-          </p>
-
-          <p
-            className={`mt-3 text-3xl font-semibold tracking-[-0.04em] ${
-              accent
-                ? 'text-[#D98A32]'
-                : 'text-[#F1F2F3]'
-            }`}
-          >
+          <p className="text-xs text-[#747C85]">{label}</p>
+          <p className={`mt-3 text-3xl font-semibold tracking-[-0.04em] ${accent ? 'text-[#D98A32]' : 'text-[#F1F2F3]'}`}>
             {value}
           </p>
-
         </div>
-
-
-        <Icon
-          size={19}
-          strokeWidth={1.7}
-          className={
-            accent
-              ? 'text-[#D98A32]'
-              : 'text-[#707984]'
-          }
-        />
-
+        <Icon size={19} strokeWidth={1.7} className={accent ? 'text-[#D98A32]' : 'text-[#707984]'} />
       </div>
-
-
-      <p className="mt-4 font-mono text-[10px] text-[#686F78]">
-        {change}
-      </p>
-
     </div>
   )
 }
 
 
-function PerformanceRow({
-  label,
-  value,
-  percent,
-  healthy,
-}) {
+function BreakdownList({ loading, items, emptyText }) {
+  if (loading) {
+    return <p className="mt-8 text-xs text-[#5F6770]">Loading…</p>
+  }
+  if (!items || items.length === 0) {
+    return <p className="mt-8 text-xs text-[#5F6770]">{emptyText}</p>
+  }
+  const total = items.reduce((sum, item) => sum + item.count, 0) || 1
+
   return (
-    <div className="border-b border-[#22272D] py-5 first:pt-0 last:border-b-0">
+    <div className="mt-6 space-y-4">
+      {items.slice(0, 8).map((item, index) => {
+        const percent = Math.round((item.count / total) * 100)
+        return (
+          <div key={item.label}>
+            <div className="flex items-center justify-between">
+              <p className="text-xs capitalize text-[#9BA2AA]">{item.label}</p>
+              <p className="font-mono text-xs font-semibold text-[#D7DADD]">{item.count} · {percent}%</p>
+            </div>
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#22272D]">
+              <div
+                className="h-full rounded-full"
+                style={{ width: `${percent}%`, backgroundColor: SERIES_COLORS[index % SERIES_COLORS.length] }}
+              />
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
 
+
+function StatRow({ label, value }) {
+  return (
+    <div className="rounded-xl border border-[#252A30] bg-[#0E1114] p-4">
       <div className="flex items-center justify-between">
-
-        <p className="text-xs text-[#969DA5]">
-          {label}
-        </p>
-
-        <p
-          className={`font-mono text-xs font-semibold ${
-            healthy
-              ? 'text-[#75A986]'
-              : 'text-[#D98A32]'
-          }`}
-        >
-          {value}
-        </p>
-
+        <p className="text-sm text-[#B8BDC3]">{label}</p>
+        <p className="font-mono text-lg font-semibold text-[#D98A32]">{value}</p>
       </div>
-
-
-      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-[#22272D]">
-
-        <div
-          className={`h-full rounded-full ${
-            healthy
-              ? 'bg-[#5D9B73]'
-              : 'bg-[#D98A32]'
-          }`}
-          style={{
-            width: `${percent}%`,
-          }}
-        />
-
-      </div>
-
     </div>
   )
 }

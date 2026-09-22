@@ -11,20 +11,23 @@ import os
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
 
 import cv2
+import math
 import queue
+import re
 import threading
 import time
 import uuid
 from datetime import datetime
 
-from backend import send_detection, send_exit
+from backend import send_detection, send_entry_update, send_exit
 from color_classification import estimate_vehicle_color_with_confidence
 from config import (
     CAMERA_INDEX, COLOR_MIN_CONF, COLOR_MODEL_MIN_INTERVAL_SEC, COLOR_REQUIRED_HITS, DEBUG_COLOR, DEBUG_OCR_SAVE_INPUTS,
     DEBUG_OCR_VERBOSE, DETECTION_ROI, DISPLAY_SCALE, DRAW_DETECTION_ROIS,
     CAMERA_RECONNECT_DELAY_SEC, DETECTED_GRACE_SEC, ENABLE_MAKE_MODEL, EXIT_AFTER_SEC, EXIT_ARM_Y, EXIT_CROSS_Y,
     EXIT_MIN_TRACK_FRAMES, EXIT_TRACK_ROI, FRAME_H, FRAME_W,
-    MAKE_MODEL_MIN_CONF, MAKE_MODEL_MIN_INTERVAL_SEC, MIN_PLATE_AREA_PIXELS, MIN_PLATE_AREA_RATIO,
+    ATTRIBUTE_FALLBACK_SEC, MAKE_MODEL_MIN_CONF, MAKE_MODEL_MIN_INTERVAL_SEC, MIN_PLATE_AREA_PIXELS, MIN_PLATE_AREA_RATIO,
+    ENTRY_DIRECTION_SPLIT_Y, VEHICLE_FRAME_EDGE_MARGIN,
     MIN_PLATE_BOX_H, MIN_PLATE_BOX_W, OCR_MIN_CONF, PLATE_LINE_SPLIT_RATIO, PLATE_NUMBER_ALLOWLIST,
     OCR_DRAIN_GRACE_SEC, OCR_MAX_JOBS_PER_TRACK, PLATE_CHANGE_MIN_CONF_GAIN,
     PLATE_TRACKER_CANDIDATES, PROVINCE_ALLOWLIST, SINGLE_READ_PROMOTION_MIN_CONF, TRACK_DISPLAY_MAX_AGE_SEC,
@@ -35,13 +38,13 @@ from detector import find_plate_yolo_candidates
 from make_model_classifier import infer_make_model
 from make_model_stabilizer import MakeModelStabilizer
 from ocr import _is_thai_text, _normalize_thai_text, ocr_best
-from plate_filter import is_plausible_plate_text, normalize_plate_text
+from plate_filter import is_plausible_plate_text, normalize_plate_text, plates_roughly_agree
 from province_parser import match_province
 from stabilizer import PlateStabilizer
 from thai_plate_recognizer import recognize_thai_plate
 from tracker import BurstTracker
-from utils import normalize_plate_crop
-from vehicle_detector import find_vehicle_tracks
+from utils import normalize_plate_crop, put_label
+from vehicle_detector import find_vehicle_tracks, reset_vehicle_tracker
 
 
 # Every OCR job carries the owning ByteTrack ID, preventing cross-car updates.
@@ -80,9 +83,11 @@ def _new_session(track_id, now):
         "last_color_debug": None, "last_color_attempt": 0.0, "color_job_pending": False,
         "make": "unknown", "model": "unknown", "mm_conf": 0.0, "last_make_attempt": 0.0,
         "make_logged": False, "make_job_pending": False,
-        "box": None, "plate_box": None, "last_seen": now, "frames": 0,
+        "box": None, "plate_box": None, "is_entering": None,
+        "first_seen": now, "last_seen": now, "frames": 0,
         "exit_armed": False, "exit_crossed": False,
         "entry_sent": False, "exit_sent": False,
+        "entry_event_id": None, "entry_make_sent": "unknown", "entry_skip_logged": False,
         "ocr_jobs_pending": 0, "ocr_jobs_submitted": 0,
     }
 
@@ -146,6 +151,52 @@ def _get_session(track_id, now, box=None):
         return session
 
 
+def _vehicle_fully_framed(box, margin=VEHICLE_FRAME_EDGE_MARGIN):
+    """Whether this vehicle's box sits clear of every frame edge.
+
+    See VEHICLE_FRAME_EDGE_MARGIN in config.py for why a box touching the
+    frame boundary means the crop is a fragment of the vehicle, not the whole
+    thing."""
+    x, y, w, h = box
+    return x > margin and y > margin and x + w < FRAME_W - margin and y + h < FRAME_H - margin
+
+
+def _classify_direction(box):
+    """Guess whether a freshly-created session is entering from the road or
+    already inside and now leaving, from where its box first sits within
+    VEHICLE_ENTRY_ROI. See ENTRY_DIRECTION_SPLIT_Y in config.py."""
+    _, y, _, h = box
+    return y + h / 2 < ENTRY_DIRECTION_SPLIT_Y
+
+
+def _attribute_ready(session, now):
+    """Whether this vehicle should be attempted yet for colour or make/model
+    -- both wait on the same direction-based rule (see
+    ENTRY_DIRECTION_SPLIT_Y's comment for why entering and exiting traffic
+    are handled oppositely): an entering vehicle is captured as soon as it
+    is trackable at all; an exiting vehicle keeps waiting for a legible
+    plate (the same "this is definitely a good view" signal OCR already
+    requires), with ATTRIBUTE_FALLBACK_SEC as a bounded worst case if its
+    plate is never found at all.
+
+    This does NOT check framing (see _vehicle_fully_framed) -- that check is
+    make-only. An edge-clipped crop (a door panel, a taillight -- see
+    VEHICLE_FRAME_EDGE_MARGIN's comment) has been observed making make/model
+    confidently wrong; colour has not shown the same failure (a car's colour
+    is usually still readable from a fragment of it), so it is not held back
+    by this on top of the direction-based wait, to avoid delaying it for a
+    problem with no evidence it actually has.
+
+    Must be called while holding sessions_lock (plate_box and is_entering
+    are both written under it)."""
+    if session["is_entering"]:
+        return True
+    return (
+        session["plate_box"] is not None
+        or now - session["first_seen"] >= ATTRIBUTE_FALLBACK_SEC
+    )
+
+
 def _plate_vehicle_match(plate_box, vehicles):
     """Return the exact tracked vehicle that owns this plausible plate box."""
     px, py, pw, ph = plate_box
@@ -179,19 +230,55 @@ def _queue_entry_if_ready(session):
     re-tracked under a new ID while actually leaving would otherwise also
     pass the colour check and be logged as a second, bogus entry for a
     vehicle that is already inside."""
-    if (
-        session["entry_sent"]
-        or session["color_conf"] < COLOR_MIN_CONF
-        or session["exit_armed"]
-    ):
+    if session["entry_sent"] or session["color_conf"] < COLOR_MIN_CONF:
         return
+    if session["exit_armed"]:
+        # Otherwise this is completely silent, and a car that simply never
+        # shows up on the dashboard looks like a backend or frontend bug.
+        if not session["entry_skip_logged"]:
+            session["entry_skip_logged"] = True
+            print(
+                f"[ENTRY-SKIPPED] track={session['id']} color={session['color']} "
+                f"make={session['make']} box={session['box']} -- exit already armed "
+                "(this vehicle passed through the exit corridor before its colour was "
+                "confirmed), so no entry is sent",
+                flush=True,
+            )
+        return
+    event_id = str(uuid.uuid4())
     try:
         backend_queue.put_nowait({
-            "type": "entry", "event_id": str(uuid.uuid4()), "track_id": session["id"],
+            "type": "entry", "event_id": event_id, "track_id": session["id"],
             "plate": session["plate"], "conf": session["plate_conf"],
             "color": session["color"], "make": session["make"],
         })
         session["entry_sent"] = True
+        session["entry_event_id"], session["entry_make_sent"] = event_id, session["make"]
+    except queue.Full:
+        pass
+
+
+def _queue_entry_update_if_needed(session):
+    """Tell the backend the make once it resolves after the entry went out.
+
+    The entry is sent the moment colour is confident, which is normally before
+    make has its agreeing reads, so it carries make "unknown".  Only the first
+    resolved make is sent -- the backend never overwrites a value the visit
+    already has.  Must be called while holding sessions_lock; the single
+    backend worker drains the queue in order, so this always lands after the
+    entry it refers to."""
+    if (
+        not session["entry_sent"]
+        or session["entry_make_sent"] != "unknown"
+        or session["make"] == "unknown"
+    ):
+        return
+    try:
+        backend_queue.put_nowait({
+            "type": "entry_update", "event_id": session["entry_event_id"], "track_id": session["id"],
+            "color": session["color"], "make": session["make"],
+        })
+        session["entry_make_sent"] = session["make"]
     except queue.Full:
         pass
 
@@ -210,7 +297,7 @@ def _queue_exit_if_needed(session, reason):
         backend_queue.put_nowait({
             "type": "exit", "event_id": str(uuid.uuid4()), "track_id": session["id"],
             "plate": session["plate"], "color": session["color"], "make": session["make"],
-            "reason": reason,
+            "entry_event_id": session["entry_event_id"], "reason": reason,
         })
         session["exit_sent"] = True
     except queue.Full:
@@ -304,6 +391,7 @@ def _apply_make_result(session, track_id, make, mm_model, mm_conf, now):
     if not result:
         return None
     session["make"], session["model"], session["mm_conf"] = result["make"], result["model"], result["conf"]
+    _queue_entry_update_if_needed(session)
     if session["make_logged"]:
         return None
     session["make_logged"] = True
@@ -375,7 +463,13 @@ def backend_worker():
             if response:
                 tag = "NEW" if response.get("is_new_visit") else "seen again"
                 print(f"[{tag}] track={job['track_id']} plate={job['plate'] or '<none yet>'} color={job['color']}", flush=True)
-        elif job["type"] == "exit" and send_exit(job["event_id"], job["plate"], job["color"], job["make"]):
+        elif job["type"] == "entry_update":
+            response = send_entry_update(job["event_id"], job["color"], job["make"])
+            if response:
+                print(f"[ENTRY-UPDATE] track={job['track_id']} make={job['make']} -> {response.get('status')}", flush=True)
+        elif job["type"] == "exit" and send_exit(
+            job["event_id"], job["plate"], job["color"], job["make"], job.get("entry_event_id")
+        ):
             print(f"[EXIT] track={job['track_id']} plate={job['plate']} reason={job['reason']}", flush=True)
 
 
@@ -396,32 +490,43 @@ def ocr_worker():
             if split <= 0 or split >= crop.shape[0]:
                 continue
             trained_result = recognize_thai_plate(crop)
-            plate, conf = trained_result["plate"], trained_result["confidence"]
+            char_plate = normalize_plate_text(trained_result["plate"])
+            char_conf = trained_result["confidence"]
             province_raw, province_conf = (
                 trained_result["province_code"],
                 trained_result["province_confidence"],
             )
             province_from_model = bool(province_raw)
-            primary_plate, primary_conf = plate, conf
-            if not plate or conf < OCR_MIN_CONF:
-                plate, conf = ocr_best(crop[:split, :], PLATE_NUMBER_ALLOWLIST)
-                primary_plate, primary_conf = plate, conf
-            if not plate or conf < OCR_MIN_CONF:
+            # Always run EasyOCR too, rather than only when character.pt
+            # fails -- the two engines make different mistakes (character.pt
+            # confidently swaps 8/9/0; EasyOCR tends to add a stray digit or
+            # drop a letter instead), so the only way to catch character.pt
+            # being confidently WRONG is to have a second, independent
+            # reading to check it against every time, not just when it gives
+            # up. See plates_roughly_agree() for how the two are reconciled.
+            easy_plate, easy_conf = ocr_best(crop[:split, :], PLATE_NUMBER_ALLOWLIST)
+            easy_plate = normalize_plate_text(easy_plate)
+            char_ok = char_plate and char_conf >= OCR_MIN_CONF and is_plausible_plate_text(char_plate)
+            easy_ok = easy_plate and easy_conf >= OCR_MIN_CONF and is_plausible_plate_text(easy_plate)
+            if not char_ok and not easy_ok:
+                # Neither primary engine produced anything usable -- fall
+                # back to a heavier, upscaled EasyOCR pass, exactly as
+                # before. Nothing to cross-check this reading against, so it
+                # is offered on its own like any single-source read.
                 alternate = normalize_plate_crop(crop[:split, :], target_w=1400)
+                candidates = []
                 if alternate is not None:
-                    alternate_plate, alternate_conf = ocr_best(
-                        alternate,
-                        PLATE_NUMBER_ALLOWLIST,
-                        threshold=0.20,
-                    )
-                    # Never let a noisy fallback replace a plate that already
-                    # has a valid registration shape.  Use it only when it is
-                    # valid and improves on the primary OCR result.
-                    if is_plausible_plate_text(alternate_plate) and (
-                        not is_plausible_plate_text(primary_plate)
-                        or alternate_conf > primary_conf
-                    ):
-                        plate, conf = alternate_plate, alternate_conf
+                    alt_plate, alt_conf = ocr_best(alternate, PLATE_NUMBER_ALLOWLIST, threshold=0.20)
+                    alt_plate = normalize_plate_text(alt_plate)
+                    if is_plausible_plate_text(alt_plate):
+                        candidates = [(alt_plate, alt_conf)]
+                agree = True  # a single (or no) source -- nothing to disagree with
+            elif char_ok and easy_ok:
+                agree = plates_roughly_agree(char_plate, easy_plate)
+                candidates = [(char_plate, char_conf), (easy_plate, easy_conf)]
+            else:
+                candidates = [(char_plate, char_conf)] if char_ok else [(easy_plate, easy_conf)]
+                agree = True  # only one source read anything -- nothing to disagree with
             if ENABLE_PROVINCE_OCR and not province_from_model:
                 province_raw, province_conf = ocr_best(
                     crop[split:, :],
@@ -440,7 +545,8 @@ def ocr_worker():
                     session = vehicle_sessions[session_id]
                     session["ocr_jobs_pending"] = max(0, session["ocr_jobs_pending"] - 1)
 
-        plate = normalize_plate_text(plate)
+        if not candidates and DEBUG_OCR_VERBOSE:
+            print(f"[OCR] track={track_id} rejected: neither engine produced a usable read", flush=True)
         # Province codes come from the trained model and are review hints, not
         # an automatic final decision.  EasyOCR text still uses fuzzy matching.
         province = province_raw if province_from_model else match_province(province_raw)
@@ -453,49 +559,58 @@ def ocr_worker():
                 hit = session["province_stabilizer"].offer(province, province_conf, province, now)
                 if hit:
                     province = hit["text"]
-            if not (plate and conf >= OCR_MIN_CONF and is_plausible_plate_text(plate)):
-                if DEBUG_OCR_VERBOSE:
-                    print(f"[OCR] track={track_id} rejected text={plate!r} conf={conf:.2f}", flush=True)
-                continue
-            if (
-                conf > session["provisional_conf"]
-                or (
-                    conf == session["provisional_conf"]
-                    and len(plate) > len(session["provisional_plate"])
-                )
-            ):
-                session["provisional_plate"] = plate
-                session["provisional_province"] = province
-                session["provisional_conf"] = conf
-            stable = session["plate_stabilizer"].offer(plate, conf, province, now)
-            if stable is None:
-                if DEBUG_OCR_VERBOSE:
-                    print(
-                        f"[OCR] track={track_id} candidate={plate} conf={conf:.2f} "
-                        "waiting for matching read (1/2)",
-                        flush=True,
+            # Two candidates this attempt (character.pt and EasyOCR) means
+            # each is offered to the stabilizer separately -- when they
+            # genuinely agree, PlateStabilizer's own fuzzy matching merges
+            # them into the same growing candidate, so agreement can confirm
+            # a plate from a single attempt instead of needing two whole
+            # attempts to agree with only itself.  When they DISAGREE,
+            # `agree` is False and provisional_plate (the fast-vehicle,
+            # single-read escape hatch -- see SINGLE_READ_PROMOTION_MIN_CONF)
+            # deliberately does not update from this attempt: a vehicle that
+            # leaves before a second attempt ever runs must not have its one
+            # and only reading be one two independent engines actively
+            # disputed, even if that engine's own confidence looked high.
+            for plate, conf in candidates:
+                if agree and (
+                    conf > session["provisional_conf"]
+                    or (
+                        conf == session["provisional_conf"]
+                        and len(plate) > len(session["provisional_plate"])
                     )
-                continue
-            if (
-                session["plate"]
-                and stable["text"] != session["plate"]
-                and (
-                    session["entry_sent"]
-                    or stable["conf"] < session["plate_conf"] + PLATE_CHANGE_MIN_CONF_GAIN
-                )
-            ):
-                if DEBUG_OCR_VERBOSE:
-                    print(
-                        f"[OCR] track={track_id} kept plate={session['plate']} "
-                        f"instead of conflicting read={stable['text']} "
-                        f"(conf={stable['conf']:.2f})",
-                        flush=True,
+                ):
+                    session["provisional_plate"] = plate
+                    session["provisional_province"] = province
+                    session["provisional_conf"] = conf
+                stable = session["plate_stabilizer"].offer(plate, conf, province, now)
+                if stable is None:
+                    if DEBUG_OCR_VERBOSE:
+                        print(
+                            f"[OCR] track={track_id} candidate={plate} conf={conf:.2f} "
+                            "waiting for matching read (1/2)",
+                            flush=True,
+                        )
+                    continue
+                if (
+                    session["plate"]
+                    and stable["text"] != session["plate"]
+                    and (
+                        session["entry_sent"]
+                        or stable["conf"] < session["plate_conf"] + PLATE_CHANGE_MIN_CONF_GAIN
                     )
-                continue
-            session["plate"], session["province"], session["plate_conf"] = stable["text"], stable["province"], stable["conf"]
-            session["plate_hits"] = stable["hits"]
-            _queue_entry_if_ready(session)
-            _mark_detected_ready(session, now)
+                ):
+                    if DEBUG_OCR_VERBOSE:
+                        print(
+                            f"[OCR] track={track_id} kept plate={session['plate']} "
+                            f"instead of conflicting read={stable['text']} "
+                            f"(conf={stable['conf']:.2f})",
+                            flush=True,
+                        )
+                    continue
+                session["plate"], session["province"], session["plate_conf"] = stable["text"], stable["province"], stable["conf"]
+                session["plate_hits"] = stable["hits"]
+                _queue_entry_if_ready(session)
+                _mark_detected_ready(session, now)
 
 
 def _update_vehicle_session(vehicle, frame, now):
@@ -504,6 +619,8 @@ def _update_vehicle_session(vehicle, frame, now):
     center_x, center_y = vx + vw / 2, vy + vh / 2
     session = _get_session(track_id, now, vehicle["box"])
     with sessions_lock:
+        if session["is_entering"] is None:
+            session["is_entering"] = _classify_direction(vehicle["box"])
         session["box"], session["last_seen"], session["frames"] = vehicle["box"], now, session["frames"] + 1
         session_frame_count = session["frames"]
 
@@ -539,6 +656,7 @@ def _update_vehicle_session(vehicle, frame, now):
             and not session["color_job_pending"]
             and color_due
             and not ocr_busy
+            and _attribute_ready(session, now)
         ):
             session["last_color_attempt"] = now
             session["color_job_pending"] = True
@@ -552,6 +670,8 @@ def _update_vehicle_session(vehicle, frame, now):
             and not session["make_job_pending"]
             and make_due
             and not ocr_busy
+            and _attribute_ready(session, now)
+            and _vehicle_fully_framed(vehicle["box"])
         ):
             session["last_make_attempt"] = now
             session["make_job_pending"] = True
@@ -652,43 +772,104 @@ def _retire_missing_sessions(now):
                 del session_aliases[old_track_id]
 
 
-def _open_capture():
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_FFMPEG)
+def _crop_native(native_frame, x1, y1, x2, y2):
+    """Cut a box given in FRAME_W x FRAME_H coordinates out of the full-resolution frame."""
+    native_h, native_w = native_frame.shape[:2]
+    scale_x, scale_y = native_w / FRAME_W, native_h / FRAME_H
+    return native_frame[
+        int(y1 * scale_y):int(math.ceil(y2 * scale_y)),
+        int(x1 * scale_x):int(math.ceil(x2 * scale_x)),
+    ]
+
+
+def _open_capture(source=None):
+    cap = cv2.VideoCapture(CAMERA_INDEX if source is None else source, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
-def run_live():
-    global stop_flag
-    cap = _open_capture()
-    if not cap.isOpened():
-        print(f"Cannot open camera: {CAMERA_INDEX}")
-        return
-    cv2.namedWindow("Gas Station LPR", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Gas Station LPR", int(FRAME_W * DISPLAY_SCALE), int(FRAME_H * DISPLAY_SCALE))
-    threading.Thread(target=ocr_worker, daemon=True).start()
-    threading.Thread(target=attributes_worker, daemon=True).start()
-    threading.Thread(target=backend_worker, daemon=True).start()
-    frame_count, fps_count, fps, last_fps_at, last_plate_box = 0, 0, 0.0, time.time(), None
-    print("Live detection started. Press 'q' to quit | 's' to screenshot", flush=True)
+def _redact_credentials(url):
+    """Hide user:password in a stream URL before it is printed or shown."""
+    return re.sub(r"(://[^/:@\s]+):[^@/\s]*@", r"\1:***@", str(url))
 
-    while True:
+
+def _reset_run_state():
+    """Start every run from a clean slate: a second run from the desktop app
+    must not inherit the previous run's vehicles, queued jobs or track IDs."""
+    with sessions_lock:
+        vehicle_sessions.clear()
+        session_aliases.clear()
+    for pending in (ocr_queue, attributes_queue, backend_queue):
+        while True:
+            try:
+                pending.get_nowait()
+            except queue.Empty:
+                break
+    reset_vehicle_tracker()
+
+
+def run_live(source=None, on_frame=None, should_stop=None):
+    """Run detection on ``source`` (default: the configured camera).
+
+    With no arguments this is the original OpenCV-window loop.  The desktop app
+    (app.py) instead passes ``on_frame`` -- called with each annotated frame in
+    place of the window -- and ``should_stop`` -- polled every frame.  A video
+    file ends the run when it finishes; a live stream reconnects."""
+    global stop_flag
+    source = CAMERA_INDEX if source is None else source
+    use_window = on_frame is None
+    is_file = os.path.isfile(str(source))
+
+    def stopping():
+        return stop_flag or (should_stop is not None and should_stop())
+
+    cap = _open_capture(source)
+    if not cap.isOpened():
+        print(f"Cannot open camera: {_redact_credentials(source)}", flush=True)
+        return
+    stop_flag = False
+    _reset_run_state()
+    if use_window:
+        cv2.namedWindow("Gas Station LPR", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Gas Station LPR", int(FRAME_W * DISPLAY_SCALE), int(FRAME_H * DISPLAY_SCALE))
+    workers = [
+        threading.Thread(target=worker, daemon=True)
+        for worker in (ocr_worker, attributes_worker, backend_worker)
+    ]
+    for worker in workers:
+        worker.start()
+    frame_count, fps_count, fps, last_fps_at, last_plate_box = 0, 0, 0.0, time.time(), None
+    print(
+        "Live detection started." + (" Press 'q' to quit | 's' to screenshot" if use_window else ""),
+        flush=True,
+    )
+
+    while not stopping():
         ret, frame = cap.read()
         if not ret:
+            if is_file:
+                print("End of video file.", flush=True)
+                break
             print("Lost camera feed, attempting to reconnect...", flush=True)
             cap.release()
             attempt = 0
-            while not stop_flag:
+            while not stopping():
                 attempt += 1
                 time.sleep(CAMERA_RECONNECT_DELAY_SEC)
-                cap = _open_capture()
+                cap = _open_capture(source)
                 if cap.isOpened():
                     print(f"Reconnected after {attempt} attempt(s).", flush=True)
                     break
                 print(f"Reconnect attempt {attempt} failed, retrying...", flush=True)
-            if stop_flag:
+            if stopping():
                 break
             continue
+        # Detection and tracking run on the downscaled frame, but plate crops
+        # for OCR are cut from the full-resolution one: the stream is 2560x1440
+        # and a plate that is only ~62px wide in the 1500-wide frame is ~106px
+        # wide here -- detail the character model/EasyOCR can never get back
+        # once it has been resized away.
+        native_frame = frame
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         frame_count, fps_count, now = frame_count + 1, fps_count + 1, time.time()
         if now - last_fps_at >= 1:
@@ -726,7 +907,11 @@ def run_live():
             if valid:
                 track_id, session = vehicle["id"], _get_session(vehicle["id"], now)
                 pad_x, pad_y = max(2, int(w * 0.10)), max(2, int(h * 0.16))
-                crop = frame[max(0, y - pad_y):min(FRAME_H, y + h + pad_y), max(0, x - pad_x):min(FRAME_W, x + w + pad_x)]
+                crop = _crop_native(
+                    native_frame,
+                    max(0, x - pad_x), max(0, y - pad_y),
+                    min(FRAME_W, x + w + pad_x), min(FRAME_H, y + h + pad_y),
+                )
                 with sessions_lock:
                     session["plate_box"] = box
                     session["tracker"].offer(frame[y:y + h, x:x + w], crop, box_conf)
@@ -765,11 +950,14 @@ def run_live():
             if session["box"]:
                 x, y, w, h = session["box"]
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                cv2.putText(frame, f"#{session['id']} {session['plate'] or 'reading'} | {session['color']}", (x, max(18, y - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                put_label(frame, f"#{session['id']} {session['plate'] or 'reading'} | {session['color']}", (x, max(18, y - 7)))
         if last_plate_box:
             x, y, w, h = last_plate_box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.putText(frame, f"FPS:{fps:.1f}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        if on_frame is not None:
+            on_frame(frame)
+            continue
         cv2.imshow("Gas Station LPR", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -779,8 +967,15 @@ def run_live():
             filename = f"screenshot_{datetime.now().strftime('%H%M%S')}.jpg"
             cv2.imwrite(filename, frame)
             print(f"Saved {filename}", flush=True)
+    # Tell the worker threads to finish and wait for them, so a run started
+    # again straight afterwards (the desktop app's Stop then Start) never has
+    # two sets of workers competing for the same queues.
+    stop_flag = True
     cap.release()
-    cv2.destroyAllWindows()
+    for worker in workers:
+        worker.join(timeout=10)
+    if use_window:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

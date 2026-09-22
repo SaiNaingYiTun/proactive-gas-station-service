@@ -21,7 +21,14 @@ Thumbs.db
 # These are large binary artifacts and/or contain real license-plate images,
 # so keep them local rather than committing them.
 ai-module/debug_crops/
-ai-module/runs/
+# Model training runs -- Ultralytics writes these under whatever directory
+# the training script is run from, so this needs to match at any depth
+# (ai-module/runs/, a top-level runs/, etc.), not just one fixed path.
+runs/
+# Pretrained/base checkpoints Ultralytics downloads on demand (e.g. a
+# top-level weights/ dir), separate from this project's own trained models
+# below.
+weights/
 # brand_dataset is a classify-style dataset: one folder per make under
 # train/ and val/. Ignore every image inside each class folder but keep the
 # folder (and its .gitkeep) so the scaffold itself stays committed.
@@ -29,3 +36,24 @@ ai-module/brand_dataset/train/*/*
 ai-module/brand_dataset/val/*/*
 !ai-module/brand_dataset/train/*/.gitkeep
 !ai-module/brand_dataset/val/*/.gitkeep
+# Ultralytics' own cache files and the raw archive the train/val folders
+# above were extracted from -- both regenerate/re-extract on demand.
+ai-module/brand_dataset/*.cache
+ai-module/brand_dataset/*.zip
+# Desktop app: remembers the last stream link, which can contain the camera password.
+ai-module/app_settings.json
+
+# Real plate photos and their true numbers (for training the character model) stay local.
+ai-module/plate_dataset/
+
+# Trained model weights (detector/classifier checkpoints, and every
+# brand.pt.* backup/candidate snapshot from tuning it) -- large binaries that
+# belong in model storage, not git. Runtime always loads them from the paths
+# in ai-module/config.py, so nothing here needs to be committed for the app
+# to run; whoever sets up a new checkout just needs a copy of these files.
+ai-module/*.pt
+ai-module/*.pt.*
+
+# Ad hoc debug screenshots dropped straight in ai-module/ while tuning
+# detection live.
+ai-module/screenshot_*.jpg

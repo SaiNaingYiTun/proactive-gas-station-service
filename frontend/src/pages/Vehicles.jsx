@@ -3,18 +3,22 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   CarFront,
   CircleCheck,
+  Clock3,
   DoorOpen,
+  Pencil,
   Search,
   ShieldAlert,
+  X,
 } from 'lucide-react'
 
-import { fetchVisits } from '../lib/api.js'
+import { correctVisit, fetchVisitEvents, fetchVisits } from '../lib/api.js'
 import {
   formatTime,
   latestActivityTime,
   vehicleLabel,
   visitStatusLabel,
 } from '../lib/visits.js'
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus.js'
 
 
 function Vehicles() {
@@ -24,29 +28,22 @@ function Vehicles() {
 
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('All')
+  const [selected, setSelected] = useState(null)
 
-  useEffect(() => {
-    let cancelled = false
-
+  function load() {
     fetchVisits({ limit: 200 })
-      .then((data) => {
-        if (!cancelled) setVisits(data)
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err.message)
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
+      .then((data) => setVisits(data))
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
+  }
 
-    return () => {
-      cancelled = true
-    }
-  }, [])
+  useEffect(load, [])
+  useRefetchOnFocus(load)
 
   // Visits are already ordered most-recent-first by the backend, so the
   // first row seen per plate is that vehicle's latest known state; every
-  // later row for the same plate just adds to its visit count.
+  // later row for the same plate just adds to its visit count. Clicking a
+  // row below opens/edits that latest visit specifically.
   const vehicles = useMemo(() => {
     const grouped = new Map()
 
@@ -109,7 +106,7 @@ function Vehicles() {
         </h2>
 
         <p className="mt-2 text-sm text-[#727A84]">
-          Vehicles detected by the recognition system, grouped by plate.
+          Vehicles detected by the recognition system, grouped by plate. Click a row for details.
         </p>
 
       </div>
@@ -228,6 +225,7 @@ function Vehicles() {
                 <Heading>Last Seen</Heading>
                 <Heading>Visits</Heading>
                 <Heading>Status</Heading>
+                <Heading>{''}</Heading>
               </tr>
 
             </thead>
@@ -237,7 +235,7 @@ function Vehicles() {
 
               {!loading && filteredVehicles.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-6 py-8 text-center text-sm text-[#5F6770]">
+                  <td colSpan={7} className="px-6 py-8 text-center text-sm text-[#5F6770]">
                     No vehicles match this search.
                   </td>
                 </tr>
@@ -247,7 +245,8 @@ function Vehicles() {
 
                 <tr
                   key={vehicle.id}
-                  className="transition hover:bg-[#15191E]"
+                  onClick={() => setSelected(vehicle)}
+                  className="cursor-pointer transition hover:bg-[#15191E]"
                 >
 
                   <td className="px-6 py-4">
@@ -289,6 +288,10 @@ function Vehicles() {
 
                   </td>
 
+                  <td className="px-6 py-4 text-right">
+                    <Pencil size={14} className="inline-block text-[#4C525A]" />
+                  </td>
+
                 </tr>
 
               ))}
@@ -300,6 +303,14 @@ function Vehicles() {
         </div>
 
       </section>
+
+      {selected && (
+        <VisitDetailModal
+          visit={selected}
+          onClose={() => setSelected(null)}
+          onSaved={() => { setSelected(null); load() }}
+        />
+      )}
 
     </div>
   )
@@ -392,6 +403,174 @@ function Heading({ children }) {
     <th className="px-6 py-3.5 text-left text-[10px] font-semibold uppercase tracking-[0.15em] text-[#555E67]">
       {children}
     </th>
+  )
+}
+
+
+// ===================================================================
+// Detail / correction panel -- clicking a row opens this. It surfaces the
+// detection_events the backend already stores for the visit (previously
+// invisible anywhere in the dashboard) and lets staff correct a misread
+// plate/make/colour or clear a visit's "needs review" flag once checked.
+// ===================================================================
+
+function VisitDetailModal({ visit, onClose, onSaved }) {
+  const [events, setEvents] = useState(null)
+  const [eventsError, setEventsError] = useState(null)
+
+  const [plateNumber, setPlateNumber] = useState(visit.plate_number || '')
+  const [vehicleMake, setVehicleMake] = useState(visit.vehicle_make || '')
+  const [vehicleColor, setVehicleColor] = useState(visit.vehicle_color || '')
+  const [saveError, setSaveError] = useState(null)
+  const [saving, setSaving] = useState(false)
+
+  const needsReview = visit.match_status === 'ambiguous' || visit.match_status === 'exit_only'
+
+  useEffect(() => {
+    fetchVisitEvents(visit.id)
+      .then(setEvents)
+      .catch((err) => setEventsError(err.message))
+  }, [visit.id])
+
+  async function handleSave(extra = {}) {
+    setSaveError(null)
+    setSaving(true)
+    try {
+      const fields = { ...extra }
+      if (plateNumber !== (visit.plate_number || '')) fields.plate_number = plateNumber || null
+      if (vehicleMake !== (visit.vehicle_make || '')) fields.vehicle_make = vehicleMake
+      if (vehicleColor !== (visit.vehicle_color || '')) fields.vehicle_color = vehicleColor
+      await correctVisit(visit.id, fields)
+      onSaved()
+    } catch (err) {
+      setSaveError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+      <div className="fixed inset-0" onClick={onClose} />
+
+      <div className="relative z-10 max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-[#252A30] bg-[#12161B] shadow-2xl">
+
+        <div className="flex items-center justify-between border-b border-[#24292F] px-6 py-4">
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-[#D98A32]">Visit Detail</p>
+            <p className="mt-1 font-mono text-lg font-semibold text-[#ECEDEF]">
+              {visit.plate_number || 'Unread plate'}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-2 text-[#858D97] hover:bg-[#1C2024] hover:text-white">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="space-y-5 p-6">
+
+          {needsReview && (
+            <div className="rounded-lg border border-[#472F2F] bg-[#201414] px-3.5 py-2.5 text-xs text-[#D58A8A]">
+              This visit is flagged <span className="font-semibold">{visitStatusLabel(visit)}</span> — check the details below
+              and correct anything wrong, then mark it reviewed.
+            </div>
+          )}
+
+          <div className="grid gap-3">
+            <Field label="License plate" value={plateNumber} onChange={setPlateNumber} placeholder="Leave blank if unread" mono />
+            <Field label="Make" value={vehicleMake} onChange={setVehicleMake} placeholder="unknown" />
+            <Field label="Colour" value={vehicleColor} onChange={setVehicleColor} placeholder="unknown" />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4 text-xs">
+            <InfoRow label="Entry" value={formatTime(visit.entry_time)} />
+            <InfoRow label="Exit" value={formatTime(visit.exit_time)} />
+            <InfoRow label="Status" value={visitStatusLabel(visit)} />
+            <InfoRow label="Match status" value={visit.match_status ?? 'pending'} />
+          </div>
+
+          <div>
+            <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#8B929B]">
+              <Clock3 size={13} /> Detection timeline
+            </p>
+            {eventsError && <p className="mt-2 text-xs text-[#D58A8A]">{eventsError}</p>}
+            {!events && !eventsError && <p className="mt-2 text-xs text-[#5F6770]">Loading…</p>}
+            {events && events.length === 0 && <p className="mt-2 text-xs text-[#5F6770]">No detection events recorded.</p>}
+            {events && events.length > 0 && (
+              <div className="mt-3 space-y-2">
+                {events.map((event) => (
+                  <div key={event.id} className="flex items-center justify-between rounded-lg border border-[#252A30] bg-[#0E1114] px-3.5 py-2.5">
+                    <div>
+                      <p className="text-xs font-medium capitalize text-[#D9DCDF]">{event.event_type}</p>
+                      <p className="mt-0.5 font-mono text-[10px] text-[#5F6770]">Camera {event.camera_id} · {formatTime(event.created_at)}</p>
+                    </div>
+                    <p className="font-mono text-xs text-[#8B929B]">
+                      {event.confidence !== null && event.confidence !== undefined ? `${Math.round(event.confidence * 100)}%` : '—'}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {saveError && <p className="text-xs text-[#D58A8A]">{saveError}</p>}
+
+          <div className="flex flex-wrap gap-2 border-t border-[#24292F] pt-5">
+            <button
+              type="button"
+              onClick={() => handleSave()}
+              disabled={saving}
+              className="rounded-lg bg-[#D98A32] px-4 py-2.5 text-xs font-semibold text-[#0B0D10] transition hover:bg-[#E29A47] disabled:opacity-50"
+            >
+              {saving ? 'Saving…' : 'Save corrections'}
+            </button>
+            {needsReview && (
+              <button
+                type="button"
+                onClick={() => handleSave({ match_status: 'matched' })}
+                disabled={saving}
+                className="rounded-lg border border-[#2E4636] bg-[#142019] px-4 py-2.5 text-xs font-medium text-[#76A887] transition hover:border-[#3B5B47] disabled:opacity-50"
+              >
+                Mark as reviewed
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-[#292E34] px-4 py-2.5 text-xs text-[#AAB0B7]"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+function Field({ label, value, onChange, placeholder, mono }) {
+  return (
+    <label className="block">
+      <span className="text-[11px] font-medium text-[#8B929B]">{label}</span>
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+        className={`mt-1 w-full rounded-lg border border-[#292E34] bg-[#0D1013] px-3 py-2 text-sm text-[#D9DCDF] outline-none placeholder:text-[#505861] focus:border-[#D98A32]/60 ${mono ? 'font-mono' : ''}`}
+      />
+    </label>
+  )
+}
+
+
+function InfoRow({ label, value }) {
+  return (
+    <div className="rounded-lg border border-[#252A30] bg-[#0E1114] px-3 py-2">
+      <p className="text-[10px] uppercase tracking-wide text-[#5F6770]">{label}</p>
+      <p className="mt-0.5 text-[#D9DCDF]">{value}</p>
+    </div>
   )
 }
 

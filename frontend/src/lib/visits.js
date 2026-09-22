@@ -1,4 +1,4 @@
-// Shared display helpers so Overview/LiveDetection/Vehicles agree on how a
+// Shared display helpers so Overview/Vehicles/Analytics agree on how a
 // raw vehicle_visits row (see backend/main.py) reads on screen.
 
 export function visitStatusLabel(visit) {

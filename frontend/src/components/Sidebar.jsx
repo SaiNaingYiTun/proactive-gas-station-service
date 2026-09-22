@@ -1,24 +1,22 @@
 import {
   LayoutDashboard,
-  ScanLine,
   CarFront,
   ChartNoAxesCombined,
   Settings,
+  ShieldCheck,
   Radio,
 } from 'lucide-react'
 
 import { NavLink } from 'react-router'
+
+import { useBackendHealth } from '../lib/useBackendHealth.js'
+import { isOwner } from '../lib/auth.js'
 
 const navigationItems = [
   {
     name: 'Overview',
     path: '/',
     icon: LayoutDashboard,
-  },
-  {
-    name: 'Live Detection',
-    path: '/live-detection',
-    icon: ScanLine,
   },
   {
     name: 'Vehicles',
@@ -33,6 +31,16 @@ const navigationItems = [
 ]
 
 function Sidebar() {
+  // Replaces the old hardcoded "System Online" text: this actually polls the
+  // backend's /api/health, the same way the desktop app's own status check
+  // does, instead of showing "online" unconditionally regardless of whether
+  // anything is reachable.
+  const healthy = useBackendHealth()
+
+  const items = isOwner()
+    ? [...navigationItems, { name: 'Staff', path: '/staff', icon: ShieldCheck }]
+    : navigationItems
+
   return (
     <aside className="fixed left-0 top-0 z-40 flex h-screen w-72 flex-col border-r border-[#22272D] bg-[#0B0D10]">
 
@@ -66,7 +74,7 @@ function Sidebar() {
 
         <div className="space-y-1">
 
-          {navigationItems.map((item) => {
+          {items.map((item) => {
 
             const Icon = item.icon
 
@@ -141,28 +149,31 @@ function Sidebar() {
             <div className="flex items-center gap-2">
 
               <span className="relative flex h-2.5 w-2.5">
-
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#5D9B73] opacity-40"></span>
-
-                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[#5D9B73]"></span>
-
+                {healthy && (
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#5D9B73] opacity-40"></span>
+                )}
+                <span
+                  className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
+                    healthy === null ? 'bg-[#555D67]' : healthy ? 'bg-[#5D9B73]' : 'bg-[#C45F5F]'
+                  }`}
+                ></span>
               </span>
 
               <span className="text-xs font-medium text-[#DCE0E4]">
-                System Online
+                {healthy === null ? 'Checking…' : healthy ? 'System Online' : 'Backend Unreachable'}
               </span>
 
             </div>
 
             <Radio
               size={15}
-              className="text-[#5D9B73]"
+              className={healthy === false ? 'text-[#C45F5F]' : 'text-[#5D9B73]'}
             />
 
           </div>
 
           <p className="mt-2 text-[11px] leading-5 text-[#606872]">
-            Detection services operational
+            {healthy === false ? 'Cannot reach the backend API' : 'Detection services operational'}
           </p>
 
         </div>

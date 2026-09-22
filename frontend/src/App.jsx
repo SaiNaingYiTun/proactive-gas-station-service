@@ -1,33 +1,29 @@
 import { Routes, Route } from 'react-router'
 
 import AppLayout from './layouts/AppLayout.jsx'
+import ProtectedRoute from './components/ProtectedRoute.jsx'
 
+import Login from './pages/Login.jsx'
 import Overview from './pages/Overview.jsx'
-import LiveDetection from './pages/LiveDetection.jsx'
 import Vehicles from './pages/Vehicles.jsx'
 import Analytics from './pages/Analytics.jsx'
 import Settings from './pages/Settings.jsx'
+import StaffManagement from './pages/StaffManagement.jsx'
 
 function App() {
   return (
     <Routes>
 
+      <Route path="/login" element={<Login />} />
+
       <Route
         path="/"
         element={
-          <AppLayout>
-            <Overview />
-          </AppLayout>
-        }
-      />
-
-
-      <Route
-        path="/live-detection"
-        element={
-          <AppLayout>
-            <LiveDetection />
-          </AppLayout>
+          <ProtectedRoute>
+            <AppLayout>
+              <Overview />
+            </AppLayout>
+          </ProtectedRoute>
         }
       />
 
@@ -35,9 +31,11 @@ function App() {
       <Route
         path="/vehicles"
         element={
-          <AppLayout>
-            <Vehicles />
-          </AppLayout>
+          <ProtectedRoute>
+            <AppLayout>
+              <Vehicles />
+            </AppLayout>
+          </ProtectedRoute>
         }
       />
 
@@ -45,9 +43,11 @@ function App() {
       <Route
         path="/analytics"
         element={
-          <AppLayout>
-            <Analytics />
-          </AppLayout>
+          <ProtectedRoute>
+            <AppLayout>
+              <Analytics />
+            </AppLayout>
+          </ProtectedRoute>
         }
       />
 
@@ -55,9 +55,23 @@ function App() {
       <Route
         path="/settings"
         element={
-          <AppLayout>
-            <Settings />
-          </AppLayout>
+          <ProtectedRoute>
+            <AppLayout>
+              <Settings />
+            </AppLayout>
+          </ProtectedRoute>
+        }
+      />
+
+
+      <Route
+        path="/staff"
+        element={
+          <ProtectedRoute ownerOnly>
+            <AppLayout>
+              <StaffManagement />
+            </AppLayout>
+          </ProtectedRoute>
         }
       />
 

@@ -4,14 +4,14 @@ import {
   Activity,
   ArrowUpRight,
   CarFront,
-  ScanLine,
+  Clock3,
   ShieldAlert,
   DoorOpen,
 } from 'lucide-react'
 
 import { Link } from 'react-router'
 
-import { fetchVisits } from '../lib/api.js'
+import { fetchAnalyticsSummary, fetchVisits } from '../lib/api.js'
 import {
   formatTime,
   isToday,
@@ -23,25 +23,45 @@ import {
 
 function Overview() {
   const [visits, setVisits] = useState([])
+  const [avgDwellMinutes, setAvgDwellMinutes] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
   useEffect(() => {
     let cancelled = false
 
-    fetchVisits({ limit: 50 })
-      .then((data) => {
-        if (!cancelled) setVisits(data)
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err.message)
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
+    function load() {
+      setError(null)
+      fetchVisits({ limit: 50 })
+        .then((data) => {
+          if (!cancelled) setVisits(data)
+        })
+        .catch((err) => {
+          if (!cancelled) setError(err.message)
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
+
+      fetchAnalyticsSummary({ days: 1 })
+        .then((summary) => {
+          if (!cancelled) setAvgDwellMinutes(summary.avg_dwell_minutes)
+        })
+        .catch(() => {})
+    }
+
+    function onVisible() {
+      if (document.visibilityState === 'visible') load()
+    }
+
+    load()
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
 
     return () => {
       cancelled = true
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
     }
   }, [])
 
@@ -92,10 +112,10 @@ function Overview() {
 
 
         <Link
-          to="/live-detection"
+          to="/vehicles"
           className="flex items-center gap-2 rounded-lg bg-[#D98A32] px-4 py-2.5 text-sm font-semibold text-[#0B0D10] transition hover:bg-[#E29A47]"
         >
-          Open Live Detection
+          View All Vehicles
 
           <ArrowUpRight size={16} />
         </Link>
@@ -128,10 +148,10 @@ function Overview() {
         />
 
         <MetricCard
-          title="Active Detection"
-          value="Live"
-          label="Camera 01 operational"
-          icon={ScanLine}
+          title="Avg. Dwell Time"
+          value={avgDwellMinutes === null ? '—' : `${avgDwellMinutes}m`}
+          label="Today, entry to exit"
+          icon={Clock3}
           accent
         />
 
@@ -177,10 +197,10 @@ function Overview() {
 
 
             <Link
-              to="/live-detection"
+              to="/vehicles"
               className="text-xs font-medium text-[#D98A32] hover:text-[#E5A352]"
             >
-              View live feed
+              View all vehicles
             </Link>
 
           </div>
@@ -359,10 +379,10 @@ function Overview() {
 
 
                 <Link
-                  to="/live-detection"
+                  to="/vehicles"
                   className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg border border-[#343A41] bg-[#191D22] px-4 py-2.5 text-xs font-semibold text-[#C9CDD2] transition hover:border-[#D98A32]/50 hover:text-white"
                 >
-                  Inspect Detection
+                  Inspect in Vehicles
 
                   <ArrowUpRight size={14} />
                 </Link>

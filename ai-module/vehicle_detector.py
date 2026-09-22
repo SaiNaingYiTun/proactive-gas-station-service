@@ -89,6 +89,13 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
     return (x1, y1, x2 - x1, y2 - y1), conf
 
 
+def reset_vehicle_tracker():
+    """Forget ByteTrack's state so a new stream or clip starts with fresh track IDs.
+
+    Dropping the predictor makes the next .track() call build a new tracker."""
+    vehicle_model.predictor = None
+
+
 def find_vehicle_tracks(frame, min_conf=0.30):
     """Return ByteTrack-identified vehicle detections for the current frame."""
     results = vehicle_model.track(
