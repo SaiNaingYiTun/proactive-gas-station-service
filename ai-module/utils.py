@@ -92,3 +92,60 @@ def preprocess(crop):
 def sharpness_score(crop):
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+# cv2.putText's Hershey fonts have no Thai glyphs, so every Thai letter in a
+# plate label is drawn as "?".  Thai text goes through Pillow instead, onto
+# just the label's own patch of the frame (converting the whole frame every
+# frame would be needlessly slow).
+_THAI_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/tahomabd.ttf",
+    "C:/Windows/Fonts/tahoma.ttf",
+    "C:/Windows/Fonts/LeelawUI.ttf",
+    "/usr/share/fonts/truetype/tlwg/Loma-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
+)
+_thai_font = None
+_thai_font_searched = False
+
+
+def _get_thai_font(size=15):
+    global _thai_font, _thai_font_searched
+    if not _thai_font_searched:
+        _thai_font_searched = True
+        try:
+            from PIL import ImageFont
+        except ImportError:
+            return None
+        for path in _THAI_FONT_CANDIDATES:
+            try:
+                _thai_font = ImageFont.truetype(path, size)
+                break
+            except OSError:
+                continue
+    return _thai_font
+
+
+def put_label(frame, text, org, color=(0, 255, 255)):
+    """Draw ``text`` with its baseline-left corner at ``org``, Thai included.
+
+    ASCII-only labels keep the original cv2.putText look; anything else uses a
+    Thai-capable font, falling back to cv2.putText (Thai shown as "?") only if
+    Pillow or every candidate font is missing."""
+    font = None if text.isascii() else _get_thai_font()
+    if font is None:
+        cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        return
+
+    from PIL import Image, ImageDraw
+
+    left, top, right, bottom = font.getbbox(text, anchor="ls")
+    x0, y0 = max(0, org[0] + left - 2), max(0, org[1] + top - 2)
+    x1, y1 = min(frame.shape[1], org[0] + right + 2), min(frame.shape[0], org[1] + bottom + 2)
+    if x1 <= x0 or y1 <= y0:
+        return
+    patch = Image.fromarray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2RGB))
+    ImageDraw.Draw(patch).text(
+        (org[0] - x0, org[1] - y0), text, font=font, fill=(color[2], color[1], color[0]), anchor="ls",
+    )
+    frame[y0:y1, x0:x1] = cv2.cvtColor(np.asarray(patch), cv2.COLOR_RGB2BGR)

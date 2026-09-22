@@ -1,21 +1,85 @@
+import { useEffect, useState } from 'react'
+
 import {
   Activity,
   ArrowUpRight,
   CarFront,
-  ScanLine,
-  TriangleAlert,
-  UserRoundCheck,
+  Clock3,
+  ShieldAlert,
+  DoorOpen,
 } from 'lucide-react'
 
 import { Link } from 'react-router'
 
+import { fetchAnalyticsSummary, fetchVisits } from '../lib/api.js'
 import {
-  currentDetection,
-  recentDetections,
-} from '../data/mockDetections.js'
+  formatTime,
+  isToday,
+  latestActivityTime,
+  vehicleLabel,
+  visitStatusLabel,
+} from '../lib/visits.js'
 
 
 function Overview() {
+  const [visits, setVisits] = useState([])
+  const [avgDwellMinutes, setAvgDwellMinutes] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    function load() {
+      setError(null)
+      fetchVisits({ limit: 50 })
+        .then((data) => {
+          if (!cancelled) setVisits(data)
+        })
+        .catch((err) => {
+          if (!cancelled) setError(err.message)
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
+
+      fetchAnalyticsSummary({ days: 1 })
+        .then((summary) => {
+          if (!cancelled) setAvgDwellMinutes(summary.avg_dwell_minutes)
+        })
+        .catch(() => {})
+    }
+
+    function onVisible() {
+      if (document.visibilityState === 'visible') load()
+    }
+
+    load()
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+
+    return () => {
+      cancelled = true
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+    }
+  }, [])
+
+  const vehiclesToday = visits.filter(
+    (visit) => isToday(visit.entry_time) || isToday(visit.exit_time)
+  ).length
+
+  const currentlyInside = visits.filter(
+    (visit) => visit.visit_status === 'inside'
+  ).length
+
+  const needsReview = visits.filter(
+    (visit) => visit.match_status === 'ambiguous' || visit.match_status === 'exit_only'
+  ).length
+
+  const recentVisits = visits.slice(0, 6)
+  const latest = visits[0]
+
   return (
     <div className="mx-auto max-w-[1600px]">
 
@@ -41,17 +105,17 @@ function Overview() {
 
 
           <p className="mt-2 text-sm text-[#727A84]">
-            Real-time station activity, recognition and customer status.
+            Real-time station activity and recognition status.
           </p>
 
         </div>
 
 
         <Link
-          to="/live-detection"
+          to="/vehicles"
           className="flex items-center gap-2 rounded-lg bg-[#D98A32] px-4 py-2.5 text-sm font-semibold text-[#0B0D10] transition hover:bg-[#E29A47]"
         >
-          Open Live Detection
+          View All Vehicles
 
           <ArrowUpRight size={16} />
         </Link>
@@ -59,36 +123,43 @@ function Overview() {
       </div>
 
 
+      {error && (
+        <p className="mt-6 rounded-lg border border-[#472F2F] bg-[#201414] px-4 py-3 text-sm text-[#D58A8A]">
+          Could not reach the backend: {error}
+        </p>
+      )}
+
+
       {/* KPI Cards */}
       <div className="mt-8 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
 
         <MetricCard
           title="Vehicles Today"
-          value="48"
-          label="Detected entries"
+          value={loading ? '—' : vehiclesToday}
+          label="Detected entries/exits"
           icon={CarFront}
         />
 
         <MetricCard
-          title="Returning"
-          value="31"
-          label="Recognized customers"
-          icon={UserRoundCheck}
+          title="Currently Inside"
+          value={loading ? '—' : currentlyInside}
+          label="Open visits"
+          icon={DoorOpen}
         />
 
         <MetricCard
-          title="Active Detection"
-          value="Live"
-          label="Camera 01 operational"
-          icon={ScanLine}
+          title="Avg. Dwell Time"
+          value={avgDwellMinutes === null ? '—' : `${avgDwellMinutes}m`}
+          label="Today, entry to exit"
+          icon={Clock3}
           accent
         />
 
         <MetricCard
-          title="Open Incidents"
-          value="2"
-          label="Requires attention"
-          icon={TriangleAlert}
+          title="Needs Review"
+          value={loading ? '—' : needsReview}
+          label="Ambiguous or unmatched exits"
+          icon={ShieldAlert}
           warning
         />
 
@@ -126,10 +197,10 @@ function Overview() {
 
 
             <Link
-              to="/live-detection"
+              to="/vehicles"
               className="text-xs font-medium text-[#D98A32] hover:text-[#E5A352]"
             >
-              View live feed
+              View all vehicles
             </Link>
 
           </div>
@@ -147,7 +218,7 @@ function Overview() {
             </TableHeading>
 
             <TableHeading>
-              Customer
+              Colour
             </TableHeading>
 
             <TableHeading>
@@ -163,44 +234,42 @@ function Overview() {
 
           <div>
 
-            {recentDetections.map((detection) => (
+            {!loading && recentVisits.length === 0 && (
+              <p className="px-6 py-8 text-center text-sm text-[#5F6770]">
+                No visits recorded yet.
+              </p>
+            )}
+
+            {recentVisits.map((visit) => (
 
               <div
-                key={detection.id}
+                key={visit.id}
                 className="grid grid-cols-5 items-center border-b border-[#20252B] px-6 py-4 last:border-b-0 hover:bg-[#15191E]"
               >
 
                 <p className="text-sm font-semibold tracking-wide text-[#ECEDEF]">
-                  {detection.licensePlate}
+                  {visit.plate_number || '—'}
                 </p>
 
 
                 <p className="text-sm text-[#8B929B]">
-                  {detection.vehicle}
+                  {vehicleLabel(visit)}
                 </p>
 
 
-                <p className="text-sm text-[#A5ABB2]">
-                  {detection.customer}
+                <p className="text-sm text-[#A5ABB2] capitalize">
+                  {visit.vehicle_color || 'unknown'}
                 </p>
 
 
                 <p className="font-mono text-xs text-[#6F7780]">
-                  {detection.time}
+                  {formatTime(latestActivityTime(visit))}
                 </p>
 
 
                 <div>
 
-                  <span
-                    className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider ${
-                      detection.status === 'Returning'
-                        ? 'border-[#344B3B] bg-[#152019] text-[#73A884]'
-                        : 'border-[#3A3F45] bg-[#1C2024] text-[#858D97]'
-                    }`}
-                  >
-                    {detection.status}
-                  </span>
+                  <StatusBadge visit={visit} />
 
                 </div>
 
@@ -248,93 +317,77 @@ function Overview() {
 
           <div className="p-6">
 
-            {/* Plate */}
-            <div className="rounded-xl border border-[#303239] bg-[#0B0D10] p-5">
-
-              <p className="text-[10px] font-medium uppercase tracking-[0.22em] text-[#636B74]">
-                License Plate
+            {!latest && (
+              <p className="text-sm text-[#5F6770]">
+                {loading ? 'Loading…' : 'No detections yet.'}
               </p>
+            )}
 
-              <p className="mt-3 font-mono text-2xl font-semibold tracking-[0.08em] text-white">
-                {currentDetection.licensePlate}
-              </p>
+            {latest && (
+              <>
+                {/* Plate */}
+                <div className="rounded-xl border border-[#303239] bg-[#0B0D10] p-5">
 
+                  <p className="text-[10px] font-medium uppercase tracking-[0.22em] text-[#636B74]">
+                    License Plate
+                  </p>
 
-              <div className="mt-4 flex items-center justify-between">
-
-                <p className="text-xs text-[#707883]">
-                  Recognition confidence
-                </p>
-
-                <p className="font-mono text-xs font-semibold text-[#D98A32]">
-                  {currentDetection.confidence}%
-                </p>
-
-              </div>
-
-            </div>
+                  <p className="mt-3 font-mono text-2xl font-semibold tracking-[0.08em] text-white">
+                    {latest.plate_number || '—'}
+                  </p>
 
 
-            {/* Customer */}
-            <div className="mt-6">
+                  <div className="mt-4 flex items-center justify-between">
 
-              <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[#555E68]">
-                Matched Customer
-              </p>
+                    <p className="text-xs text-[#707883]">
+                      Status
+                    </p>
 
+                    <p className="font-mono text-xs font-semibold text-[#D98A32]">
+                      {visitStatusLabel(latest)}
+                    </p>
 
-              <div className="mt-4 flex items-center gap-3">
+                  </div>
 
-                <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-[#34302A] bg-[#201A14] text-sm font-semibold text-[#D98A32]">
-                  JD
                 </div>
 
 
-                <div>
+                {/* Vehicle */}
+                <div className="mt-6 space-y-4 border-t border-[#252A30] pt-5">
 
-                  <p className="text-sm font-semibold text-[#ECEDEF]">
-                    {currentDetection.customer.name}
-                  </p>
+                  <InfoRow
+                    label="Vehicle"
+                    value={vehicleLabel(latest)}
+                  />
 
-                  <p className="mt-1 text-xs text-[#747C86]">
-                    {currentDetection.vehicle}
-                  </p>
+                  <InfoRow
+                    label="Colour"
+                    value={latest.vehicle_color || 'Unknown'}
+                  />
+
+                  <InfoRow
+                    label="Entry"
+                    value={formatTime(latest.entry_time)}
+                  />
+
+                  <InfoRow
+                    label="Exit"
+                    value={formatTime(latest.exit_time)}
+                  />
 
                 </div>
 
-              </div>
 
-            </div>
+                <Link
+                  to="/vehicles"
+                  className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg border border-[#343A41] bg-[#191D22] px-4 py-2.5 text-xs font-semibold text-[#C9CDD2] transition hover:border-[#D98A32]/50 hover:text-white"
+                >
+                  Inspect in Vehicles
 
-
-            <div className="mt-6 space-y-4 border-t border-[#252A30] pt-5">
-
-              <InfoRow
-                label="Preferred Fuel"
-                value={currentDetection.customer.preferredFuel}
-              />
-
-              <InfoRow
-                label="Total Visits"
-                value={currentDetection.customer.totalVisits}
-              />
-
-              <InfoRow
-                label="Last Visit"
-                value={currentDetection.customer.lastVisit}
-              />
-
-            </div>
-
-
-            <Link
-              to="/live-detection"
-              className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg border border-[#343A41] bg-[#191D22] px-4 py-2.5 text-xs font-semibold text-[#C9CDD2] transition hover:border-[#D98A32]/50 hover:text-white"
-            >
-              Inspect Detection
-
-              <ArrowUpRight size={14} />
-            </Link>
+                  <ArrowUpRight size={14} />
+                </Link>
+              </>
+            )}
 
           </div>
 
@@ -447,6 +500,26 @@ function InfoRow({
       </span>
 
     </div>
+  )
+}
+
+
+function StatusBadge({ visit }) {
+  const label = visitStatusLabel(visit)
+  const needsReview = visit.match_status === 'ambiguous' || visit.match_status === 'exit_only'
+
+  return (
+    <span
+      className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider ${
+        needsReview
+          ? 'border-[#472F2F] bg-[#201414] text-[#C97A7A]'
+          : visit.visit_status === 'inside'
+            ? 'border-[#344B3B] bg-[#152019] text-[#73A884]'
+            : 'border-[#3A3F45] bg-[#1C2024] text-[#858D97]'
+      }`}
+    >
+      {label}
+    </span>
   )
 }
 

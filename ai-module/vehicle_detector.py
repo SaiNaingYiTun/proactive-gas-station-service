@@ -51,7 +51,11 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
             continue
 
         label = vehicle_model.names[cls]
-        if label.lower() not in {"car", "truck", "bus", "motorcycle"}:
+        # Motorcycles are excluded: this station's plate/colour/make pipeline
+        # is built for four-wheeled vehicles, and a motorcycle's rear view
+        # rarely has a legible full plate in the same position, wasting a
+        # tracked session and OCR attempts on a vehicle type it can't serve.
+        if label.lower() not in {"car", "truck", "bus"}:
             continue
 
         width = x2 - x1
@@ -85,6 +89,13 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
     return (x1, y1, x2 - x1, y2 - y1), conf
 
 
+def reset_vehicle_tracker():
+    """Forget ByteTrack's state so a new stream or clip starts with fresh track IDs.
+
+    Dropping the predictor makes the next .track() call build a new tracker."""
+    vehicle_model.predictor = None
+
+
 def find_vehicle_tracks(frame, min_conf=0.30):
     """Return ByteTrack-identified vehicle detections for the current frame."""
     results = vehicle_model.track(
@@ -114,7 +125,11 @@ def find_vehicle_tracks(frame, min_conf=0.30):
         except (TypeError, ValueError):
             continue
 
-        if vehicle_model.names[cls].lower() not in {"car", "truck", "bus", "motorcycle"}:
+        # Motorcycles are excluded: this station's plate/colour/make pipeline
+        # is built for four-wheeled vehicles, and a motorcycle's rear view
+        # rarely has a legible full plate in the same position, wasting a
+        # tracked session and OCR attempts on a vehicle type it can't serve.
+        if vehicle_model.names[cls].lower() not in {"car", "truck", "bus"}:
             continue
         width, height = x2 - x1, y2 - y1
         if width <= 0 or height <= 0 or width * height < w * h * 0.002:
