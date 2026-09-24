@@ -3,9 +3,6 @@ from datetime import datetime, timezone
 import requests
 
 from config import API_BASE as DEFAULT_API_BASE, CAMERA_ID
-
-# Mutable so the desktop app (app.py) can point at another backend, or switch
-# sending off for a rehearsal, without touching config.py.
 api_base = DEFAULT_API_BASE
 enabled = True
 
@@ -21,8 +18,7 @@ def set_enabled(value):
 
 
 def _iso_utc(seen_at):
-    """Capture time (a time.time() value taken when the frame was read) as an
-    ISO-8601 UTC string, or None to let the backend use its own clock."""
+    
     if seen_at is None:
         return None
     return datetime.fromtimestamp(seen_at, timezone.utc).isoformat()

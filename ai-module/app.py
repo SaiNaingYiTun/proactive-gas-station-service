@@ -1,14 +1,3 @@
-"""Desktop window for the live detection.
-
-Type (or paste) the camera's stream link -- or browse to a recorded video --
-press Start, and the annotated detection view opens inside the window, with
-the entries and exits it sends to the backend listed underneath.  The web
-dashboard stays the place where visits are reviewed.
-
-Start it with "Start Live Detection.bat" (no console window), or
-    .venv\\Scripts\\pythonw.exe app.py
-"""
-
 import os
 import queue
 import re
