@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import requests
 
 from config import API_BASE as DEFAULT_API_BASE, CAMERA_ID
@@ -18,7 +20,15 @@ def set_enabled(value):
     enabled = bool(value)
 
 
-def send_detection(event_id, plate, conf, color="unknown", make="unknown"):
+def _iso_utc(seen_at):
+    """Capture time (a time.time() value taken when the frame was read) as an
+    ISO-8601 UTC string, or None to let the backend use its own clock."""
+    if seen_at is None:
+        return None
+    return datetime.fromtimestamp(seen_at, timezone.utc).isoformat()
+
+
+def send_detection(event_id, plate, conf, color="unknown", make="unknown", seen_at=None):
     if not enabled:
         return None
     try:
@@ -35,6 +45,7 @@ def send_detection(event_id, plate, conf, color="unknown", make="unknown"):
                 "make": make,
                 "confidence": conf,
                 "camera_id": CAMERA_ID,
+                "detected_at": _iso_utc(seen_at),
             },
             timeout=3,
         )
@@ -60,7 +71,7 @@ def send_entry_update(event_id, color="unknown", make="unknown"):
         return None
 
 
-def send_exit(event_id, plate, color="unknown", make="unknown", entry_event_id=None):
+def send_exit(event_id, plate, color="unknown", make="unknown", entry_event_id=None, seen_at=None):
     if not enabled:
         return None
     try:
@@ -73,6 +84,7 @@ def send_exit(event_id, plate, color="unknown", make="unknown", entry_event_id=N
                 "color": color,
                 "make": make,
                 "entry_event_id": entry_event_id,
+                "detected_at": _iso_utc(seen_at),
             },
             timeout=3,
         )

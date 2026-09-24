@@ -206,6 +206,17 @@ class App(tk.Tk):
         ttk.Checkbutton(controls, text="Save events to backend", variable=self.send_var).grid(
             row=1, column=4, sticky="e", padx=(8, 0), pady=(8, 0))
 
+        self.save_crops_var = tk.BooleanVar(value=settings.get("save_crops", False))
+        ttk.Checkbutton(controls, text="Save crops", variable=self.save_crops_var, command=self._sync_crop_controls).grid(
+            row=2, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
+        default_crop_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_crops")
+        self.crop_dir_var = tk.StringVar(value=settings.get("crop_dir", default_crop_dir))
+        self.crop_dir_entry = ttk.Entry(controls, textvariable=self.crop_dir_var)
+        self.crop_dir_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        self.crop_dir_btn = ttk.Button(controls, text="Browse folder...", command=self._browse_crop_dir)
+        self.crop_dir_btn.grid(row=2, column=3, padx=(8, 0), pady=(8, 0))
+        self._sync_crop_controls()
+
         # The parts under the video are packed first, from the bottom up, so a
         # small window shrinks the video instead of pushing the status bar off.
         status = ttk.Frame(outer)
@@ -243,6 +254,17 @@ class App(tk.Tk):
     def _toggle_show(self):
         self.link_entry.configure(show="" if self.show_var.get() else "•")
 
+    def _sync_crop_controls(self):
+        running = self._thread is not None and self._thread.is_alive()
+        state = "normal" if (self.save_crops_var.get() and not running) else "disabled"
+        self.crop_dir_entry.configure(state=state)
+        self.crop_dir_btn.configure(state=state)
+
+    def _browse_crop_dir(self):
+        path = filedialog.askdirectory(title="Choose a folder to save plate crops")
+        if path:
+            self.crop_dir_var.set(os.path.normpath(path))
+
     def _browse(self):
         path = filedialog.askopenfilename(
             title="Choose a recorded video",
@@ -266,6 +288,7 @@ class App(tk.Tk):
             self.start_btn.configure(text="Start", style="Accent.TButton",
                                      state="normal" if self._main is not None else "disabled")
         self.browse_btn.configure(state="disabled" if running else "normal")
+        self._sync_crop_controls()
 
     def _draw_placeholder(self):
         if self._has_frame:
@@ -287,7 +310,8 @@ class App(tk.Tk):
 
     def _save_settings(self):
         data = {"stream": self.link_var.get().strip(), "backend": self.backend_var.get().strip(),
-                "send": bool(self.send_var.get())}
+                "send": bool(self.send_var.get()), "save_crops": bool(self.save_crops_var.get()),
+                "crop_dir": self.crop_dir_var.get().strip()}
         try:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as handle:
                 json.dump(data, handle)
@@ -357,6 +381,7 @@ class App(tk.Tk):
             return
         backend.set_api_base(self.backend_var.get().strip() or backend.DEFAULT_API_BASE)
         backend.set_enabled(self.send_var.get())
+        self._main.set_crop_saving(self.save_crops_var.get(), self.crop_dir_var.get().strip() or None)
         self._save_settings()
         self._stop.clear()
         with self._frame_lock:

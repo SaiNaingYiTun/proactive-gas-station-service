@@ -22,9 +22,11 @@ from datetime import datetime
 from backend import send_detection, send_entry_update, send_exit
 from color_classification import estimate_vehicle_color_with_confidence
 from config import (
-    CAMERA_INDEX, COLOR_MIN_CONF, COLOR_MODEL_MIN_INTERVAL_SEC, COLOR_REQUIRED_HITS, DEBUG_COLOR, DEBUG_OCR_SAVE_INPUTS,
+    CAMERA_INDEX, COLOR_MIN_CONF, COLOR_MODEL_MIN_INTERVAL_SEC, COLOR_REQUIRED_HITS,
+    COLOR_SINGLE_HIT_PROMOTION_MIN_CONF, DEBUG_COLOR, DEBUG_OCR_SAVE_INPUTS,
     DEBUG_OCR_VERBOSE, DETECTION_ROI, DISPLAY_SCALE, DRAW_DETECTION_ROIS,
     CAMERA_RECONNECT_DELAY_SEC, DETECTED_GRACE_SEC, ENABLE_MAKE_MODEL, EXIT_AFTER_SEC, EXIT_ARM_Y, EXIT_CROSS_Y,
+    FILE_EOF_DRAIN_TIMEOUT_SEC,
     EXIT_MIN_TRACK_FRAMES, EXIT_TRACK_ROI, FRAME_H, FRAME_W,
     ATTRIBUTE_FALLBACK_SEC, MAKE_MODEL_MIN_CONF, MAKE_MODEL_MIN_INTERVAL_SEC, MIN_PLATE_AREA_PIXELS, MIN_PLATE_AREA_RATIO,
     ENTRY_DIRECTION_SPLIT_Y, VEHICLE_FRAME_EDGE_MARGIN,
@@ -45,6 +47,20 @@ from thai_plate_recognizer import recognize_thai_plate
 from tracker import BurstTracker
 from utils import normalize_plate_crop, put_label
 from vehicle_detector import find_vehicle_tracks, reset_vehicle_tracker
+
+
+# Mutable so the desktop app (app.py) can turn on plate-crop saving and pick
+# a folder at runtime, without setting the DEBUG_OCR_SAVE_INPUTS env var
+# (which always writes to ./debug_crops).
+save_crops_enabled = False
+save_crops_dir = "./debug_crops"
+
+
+def set_crop_saving(enabled, directory=None):
+    global save_crops_enabled, save_crops_dir
+    save_crops_enabled = bool(enabled)
+    if directory:
+        save_crops_dir = directory
 
 
 # Every OCR job carries the owning ByteTrack ID, preventing cross-car updates.
@@ -251,6 +267,9 @@ def _queue_entry_if_ready(session):
             "type": "entry", "event_id": event_id, "track_id": session["id"],
             "plate": session["plate"], "conf": session["plate_conf"],
             "color": session["color"], "make": session["make"],
+            # When the camera first saw this vehicle -- the entry itself is only
+            # sent once colour settles, which can be seconds later.
+            "seen_at": session["first_seen"],
         })
         session["entry_sent"] = True
         session["entry_event_id"], session["entry_make_sent"] = event_id, session["make"]
@@ -283,14 +302,15 @@ def _queue_entry_update_if_needed(session):
         pass
 
 
-def _queue_exit_if_needed(session, reason):
+def _queue_exit_if_needed(session, reason, seen_at):
     """An exit is sent once this session has a plate, regardless of whether
     this same session ever sent its own entry. A vehicle that entered
     off-camera-view of the plate (see _queue_entry_if_ready) and is only
     re-tracked once it reaches the exit corridor never has entry_sent=True
     locally -- the backend still matches it to its real, earlier entry by
     colour/make, so this session does not need to have "seen" that entry
-    itself."""
+    itself. ``seen_at`` is the capture time of the frame the exit happened
+    on, not the (later) moment the exit is decided and sent."""
     if session["exit_sent"] or not session["plate"]:
         return
     try:
@@ -298,6 +318,7 @@ def _queue_exit_if_needed(session, reason):
             "type": "exit", "event_id": str(uuid.uuid4()), "track_id": session["id"],
             "plate": session["plate"], "color": session["color"], "make": session["make"],
             "entry_event_id": session["entry_event_id"], "reason": reason,
+            "seen_at": seen_at,
         })
         session["exit_sent"] = True
     except queue.Full:
@@ -308,6 +329,21 @@ def _has_pending_ocr_work():
     """Return whether any queued or running OCR job still needs the GPU."""
     with sessions_lock:
         return any(session["ocr_jobs_pending"] > 0 for session in vehicle_sessions.values())
+
+
+def _pending_work_remaining():
+    """Whether any OCR/colour/make job is still queued, or a finished one is
+    still on its way to the backend. Used only to give a video file a bounded
+    grace period at end-of-file (see FILE_EOF_DRAIN_TIMEOUT_SEC) instead of
+    tearing down the worker threads mid-job the instant the last frame is
+    read."""
+    if not (ocr_queue.empty() and attributes_queue.empty() and backend_queue.empty()):
+        return True
+    with sessions_lock:
+        return any(
+            session["ocr_jobs_pending"] > 0 or session["color_job_pending"] or session["make_job_pending"]
+            for session in vehicle_sessions.values()
+        )
 
 
 def _build_detected_message(session, track_id):
@@ -360,17 +396,23 @@ def _apply_color_result(session, track_id, color, color_conf, now):
     session["color_scores"][color] = session["color_scores"].get(color, 0.0) + color_conf
     session["color_counts"][color] = session["color_counts"].get(color, 0) + 1
     best = max(session["color_scores"], key=session["color_scores"].get)
-    if session["color_counts"][best] < COLOR_REQUIRED_HITS:
+    hits = session["color_counts"][best]
+    best_conf = session["color_scores"][best] / hits
+    # A single read this confident is trusted immediately rather than
+    # waiting on a second agreeing one -- see COLOR_SINGLE_HIT_PROMOTION_MIN_CONF.
+    single_hit_promoted = hits == 1 and best_conf >= COLOR_SINGLE_HIT_PROMOTION_MIN_CONF
+    if hits < COLOR_REQUIRED_HITS and not single_hit_promoted:
         return None
     session["color"] = best
-    session["color_conf"] = session["color_scores"][best] / session["color_counts"][best]
+    session["color_conf"] = best_conf
     _queue_entry_if_ready(session)
     message = None
     if not session["color_logged"]:
         session["color_logged"] = True
+        tag = " (single read)" if single_hit_promoted else ""
         message = (
             f"[COLOR] track={track_id} color={best} "
-            f"color_conf={session['color_conf']:.2f} "
+            f"color_conf={session['color_conf']:.2f}{tag} "
             f"plate={session['plate'] or '<pending>'}"
         )
     _mark_detected_ready(session, now)
@@ -459,7 +501,9 @@ def backend_worker():
         except queue.Empty:
             continue
         if job["type"] == "entry":
-            response = send_detection(job["event_id"], job["plate"], job["conf"], job["color"], job["make"])
+            response = send_detection(
+                job["event_id"], job["plate"], job["conf"], job["color"], job["make"], job["seen_at"]
+            )
             if response:
                 tag = "NEW" if response.get("is_new_visit") else "seen again"
                 print(f"[{tag}] track={job['track_id']} plate={job['plate'] or '<none yet>'} color={job['color']}", flush=True)
@@ -468,7 +512,7 @@ def backend_worker():
             if response:
                 print(f"[ENTRY-UPDATE] track={job['track_id']} make={job['make']} -> {response.get('status')}", flush=True)
         elif job["type"] == "exit" and send_exit(
-            job["event_id"], job["plate"], job["color"], job["make"], job.get("entry_event_id")
+            job["event_id"], job["plate"], job["color"], job["make"], job.get("entry_event_id"), job["seen_at"]
         ):
             print(f"[EXIT] track={job['track_id']} plate={job['plate']} reason={job['reason']}", flush=True)
 
@@ -483,9 +527,10 @@ def ocr_worker():
         try:
             if crop is None or crop.size == 0:
                 continue
-            if DEBUG_OCR_SAVE_INPUTS:
-                os.makedirs("./debug_crops", exist_ok=True)
-                cv2.imwrite(f"./debug_crops/ocr_input_{track_id}_{time.time():.0f}.jpg", crop)
+            if DEBUG_OCR_SAVE_INPUTS or save_crops_enabled:
+                target_dir = save_crops_dir if save_crops_enabled else "./debug_crops"
+                os.makedirs(target_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(target_dir, f"ocr_input_{track_id}_{time.time():.0f}.jpg"), crop)
             split = int(crop.shape[0] * PLATE_LINE_SPLIT_RATIO)
             if split <= 0 or split >= crop.shape[0]:
                 continue
@@ -695,7 +740,7 @@ def _update_vehicle_session(vehicle, frame, now):
         if crossed:
             session["exit_crossed"] = True
             _queue_entry_if_ready(session)
-            _queue_exit_if_needed(session, "crossed_exit_line")
+            _queue_exit_if_needed(session, "crossed_exit_line", now)
             print(f"[EXIT-VEHICLE] track={track_id} color={session['color']} confidence={session['color_conf']:.2f} frames={session['frames']}", flush=True)
     if detected_message:
         print(detected_message, flush=True)
@@ -765,7 +810,9 @@ def _retire_missing_sessions(now):
                     f"color={session['color']} color_conf={session['color_conf']:.2f}",
                     flush=True,
                 )
-            _queue_exit_if_needed(session, "track_disappeared")
+            # Retired seconds after it was last on camera; stamp the exit with
+            # the last frame it was actually visible in.
+            _queue_exit_if_needed(session, "track_disappeared", session["last_seen"])
             del vehicle_sessions[track_id]
         for old_track_id in list(session_aliases):
             if _current_session_id(old_track_id) not in vehicle_sessions:
@@ -839,6 +886,21 @@ def run_live(source=None, on_frame=None, should_stop=None):
     for worker in workers:
         worker.start()
     frame_count, fps_count, fps, last_fps_at, last_plate_box = 0, 0, 0.0, time.time(), None
+    # A live stream only ever hands over frames as fast as the camera itself
+    # produces them, so it's already paced. A file has no such limit --
+    # cv2.VideoCapture decodes it as fast as the CPU/GPU allow, which can run
+    # many times faster than the clip's own recording speed. That leaves the
+    # colour/make throttles and confirmation waits (all in real seconds, see
+    # config.py) far less real time per second of footage to do their job in,
+    # so pace file playback back down to the speed it was actually recorded at.
+    frame_interval = 0.0
+    next_frame_due = time.time()
+    if is_file:
+        native_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not native_fps or native_fps <= 0:
+            native_fps = 25.0        # container didn't report a real value
+        frame_interval = 1.0 / native_fps
+    hit_eof = False
     print(
         "Live detection started." + (" Press 'q' to quit | 's' to screenshot" if use_window else ""),
         flush=True,
@@ -849,6 +911,7 @@ def run_live(source=None, on_frame=None, should_stop=None):
         if not ret:
             if is_file:
                 print("End of video file.", flush=True)
+                hit_eof = True
                 break
             print("Lost camera feed, attempting to reconnect...", flush=True)
             cap.release()
@@ -955,6 +1018,13 @@ def run_live(source=None, on_frame=None, should_stop=None):
             x, y, w, h = last_plate_box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.putText(frame, f"FPS:{fps:.1f}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        if is_file:
+            next_frame_due += frame_interval
+            delay = next_frame_due - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_frame_due = time.time()   # fell behind (slow inference) -- resync instead of trying to catch up
         if on_frame is not None:
             on_frame(frame)
             continue
@@ -967,6 +1037,16 @@ def run_live(source=None, on_frame=None, should_stop=None):
             filename = f"screenshot_{datetime.now().strftime('%H%M%S')}.jpg"
             cv2.imwrite(filename, frame)
             print(f"Saved {filename}", flush=True)
+    # A file reaching its last frame is not the same as the user asking to
+    # stop -- give the workers a bounded chance to actually finish OCR/colour/
+    # make and reach the backend for whatever vehicle was still in flight,
+    # instead of dropping it the instant the last frame was read. A manual
+    # Stop (or 'q') skips this: that is a deliberate stop, not a surprise one.
+    if hit_eof and _pending_work_remaining():
+        print("Finishing in-progress detections...", flush=True)
+        deadline = time.time() + FILE_EOF_DRAIN_TIMEOUT_SEC
+        while _pending_work_remaining() and time.time() < deadline and not stopping():
+            time.sleep(0.2)
     # Tell the worker threads to finish and wait for them, so a run started
     # again straight afterwards (the desktop app's Stop then Start) never has
     # two sets of workers competing for the same queues.

@@ -17,9 +17,17 @@ export function vehicleLabel(visit) {
   return 'Unknown vehicle'
 }
 
+// Timestamps are stored in UTC. Older rows were written without an offset,
+// and `new Date()` reads an offset-less ISO string as *local* time -- which
+// shifts it by the viewer's UTC offset -- so treat those as UTC explicitly.
+function parseTimestamp(isoString) {
+  const hasOffset = /(Z|[+-]\d{2}:?\d{2})$/i.test(isoString)
+  return new Date(hasOffset ? isoString : `${isoString}Z`)
+}
+
 export function formatTime(isoString) {
   if (!isoString) return '—'
-  const date = new Date(isoString)
+  const date = parseTimestamp(isoString)
   if (Number.isNaN(date.getTime())) return '—'
   return date.toLocaleString(undefined, {
     month: 'short',
@@ -38,7 +46,7 @@ export function latestActivityTime(visit) {
 
 export function isToday(isoString) {
   if (!isoString) return false
-  const date = new Date(isoString)
+  const date = parseTimestamp(isoString)
   const now = new Date()
   return (
     date.getFullYear() === now.getFullYear() &&

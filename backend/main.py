@@ -59,6 +59,10 @@ class Detection(BaseModel):
     make: str = "unknown"
     confidence: float
     camera_id: int
+    # When the camera actually captured this vehicle (UTC). The AI sends
+    # entry/exit only after tracking/colour/OCR settle, often seconds later,
+    # so the request's arrival time is not when the vehicle was there.
+    detected_at: Optional[datetime] = None
 
 
 class ExitDetection(BaseModel):
@@ -76,6 +80,18 @@ class ExitDetection(BaseModel):
     # a direct link -- colour/make matching is only the fallback for a vehicle
     # whose entry was never seen.
     entry_event_id: Optional[UUID] = None
+    detected_at: Optional[datetime] = None
+
+
+def event_time(detected_at: Optional[datetime]) -> str:
+    """ISO timestamp for an AI event: the camera's capture time when the AI
+    sent one, otherwise now. Always timezone-aware UTC -- a naive string
+    reads back with no offset and the browser then shows it as local time."""
+    if detected_at is None:
+        return datetime.now(timezone.utc).isoformat()
+    if detected_at.tzinfo is None:
+        detected_at = detected_at.replace(tzinfo=timezone.utc)
+    return detected_at.astimezone(timezone.utc).isoformat()
 
 
 def processed_visit_id(event_id: UUID):
@@ -108,7 +124,7 @@ def _find_open_visit_candidates(data: ExitDetection):
     real value for it, instead of being excluded by an exact-match filter
     that unknown could never satisfy.
     """
-    cutoff = (datetime.utcnow() - timedelta(hours=MATCH_MAX_DWELL_HOURS)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=MATCH_MAX_DWELL_HOURS)).isoformat()
     query = (
         supabase.table("vehicle_visits")
         .select("id, vehicle_color, vehicle_make")
@@ -181,7 +197,7 @@ def complete_active_visit(data: ExitDetection):
                 "plate_number": data.plate_number,
                 "vehicle_color": data.color,
                 "vehicle_make": data.make,
-                "exit_time": datetime.utcnow().isoformat(),
+                "exit_time": event_time(data.detected_at),
                 "visit_status": "completed",
                 "match_status": "exit_only",
             })
@@ -194,7 +210,7 @@ def complete_active_visit(data: ExitDetection):
         match_status = "matched" if len(candidates) == 1 else "ambiguous"
         updates = {
             "plate_number": data.plate_number,
-            "exit_time": datetime.utcnow().isoformat(),
+            "exit_time": event_time(data.detected_at),
             "visit_status": "completed",
             "match_status": match_status,
         }
@@ -238,7 +254,7 @@ def save_detection(data: Detection):
                 "vehicle_type": data.vehicle_type,
                 "vehicle_color": data.color,
                 "vehicle_make": data.make,
-                "entry_time": datetime.utcnow().isoformat(),
+                "entry_time": event_time(data.detected_at),
                 "visit_status": "inside",
                 "match_status": "pending",
             })
@@ -255,6 +271,7 @@ def save_detection(data: Detection):
             confidence=data.confidence,
             color=data.color,
             make=data.make,
+            detected_at=data.detected_at,
         ))
 
     else:

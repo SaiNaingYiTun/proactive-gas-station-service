@@ -8,13 +8,20 @@ CAMERA_ID = 1
 
 CAMERA_INDEX = os.environ.get(
     "CAMERA_RTSP_URL",
-    "rtsp://user:password@192.168.1.209:554/Streaming/Channels/101"
+    "rtsp://admin:seniorproject2!@192.168.1.209:554/Streaming/Channels/101"
 )
 # A stream drop previously just crashed the whole process (a transient
 # network/camera hiccup then required a manual restart).  Keep retrying at
 # this interval, indefinitely, rather than giving up -- an unattended
 # station may have nobody watching to notice and restart it.
 CAMERA_RECONNECT_DELAY_SEC = 3.0
+# A recorded video file has no more frames once it reaches its end, but the
+# OCR/colour/make/backend pipeline runs on background worker threads and may
+# still be mid-job for the last few vehicles seen. Give it this long to
+# actually finish and reach the backend before the workers are torn down,
+# instead of silently dropping whatever was still in flight. Live streams
+# never hit this -- they reconnect instead of ending, so nothing is waiting.
+FILE_EOF_DRAIN_TIMEOUT_SEC = 10.0
 
 FRAME_W = 1500
 FRAME_H = 890
@@ -108,7 +115,7 @@ CHARACTER_GAP_MIN_CONF = 0.10
 # Backend
 # =============================
 
-API_BASE = "http://localhost:8000"
+API_BASE = "https://proactive-gas-station-service-kohl.vercel.app/"
 
 # =============================
 # Detection
@@ -146,6 +153,14 @@ COLOR_MODEL_MIN_INTERVAL_SEC = 0.75
 # Do not show or send a colour based on a single frame.  White and silver are
 # especially sensitive to glare, so wait for the same class twice.
 COLOR_REQUIRED_HITS = 2
+# ...unless that single frame was this confident. Waiting for a second
+# agreeing hit costs at least COLOR_MODEL_MIN_INTERVAL_SEC of real time, which
+# a vehicle only briefly in view (a fast car, or a short recorded clip) may
+# not have -- it leaves with no entry at all rather than a slightly-delayed
+# one. A read this far above the ordinary per-hit floor (COLOR_MIN_CONF) is
+# trusted on its own, the same way SINGLE_READ_PROMOTION_MIN_CONF already
+# lets one strong plate read through without its usual second confirmation.
+COLOR_SINGLE_HIT_PROMOTION_MIN_CONF = 0.70
 VEHICLE_TRACK_GAP_SEC = 1.5
 # When ByteTrack briefly loses a close vehicle and assigns a new ID, preserve
 # its existing plate/color session if the new box substantially overlaps it.
