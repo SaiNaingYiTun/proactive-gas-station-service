@@ -26,9 +26,6 @@ class BurstTracker:
         score = sharpness_score(tight) * yolo_conf
         if score > self.best_score:
             self.best_score = score
-            # Both arguments are views into the frame.  The live loop draws
-            # green rectangles onto that frame after this call; retaining the
-            # view made those rectangles part of the image later sent to OCR.
             self.best_crop = padded.copy()
             self.best_tight_crop = tight.copy()
         self.count += 1

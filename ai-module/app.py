@@ -7,7 +7,6 @@ import time
 import traceback
 from datetime import datetime
 
-# main.py only turns the make/model classifier on through this variable.
 os.environ.setdefault("ENABLE_MAKE_MODEL", "1")
 
 _log_queue = queue.Queue()
@@ -50,15 +49,15 @@ class _LineWriter:
 sys.stdout = _LineWriter(sys.__stdout__)
 sys.stderr = _LineWriter(sys.__stderr__)
 
-import json  # noqa: E402
-import tkinter as tk  # noqa: E402
-from tkinter import filedialog, messagebox, ttk  # noqa: E402
+import json  
+import tkinter as tk  
+from tkinter import filedialog, messagebox, ttk 
 
-import cv2  # noqa: E402
-import requests  # noqa: E402
-from PIL import Image, ImageTk  # noqa: E402
+import cv2  
+import requests
+from PIL import Image, ImageTk
 
-import backend  # noqa: E402
+import backend
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
 STREAM_PATTERN = re.compile(r"^(rtsp|rtsps|rtmp|http|https|udp|tcp)://", re.IGNORECASE)
@@ -67,8 +66,6 @@ BG, PANEL, FIELD = "#0d1117", "#161b22", "#0b0f14"
 TEXT, MUTED, BORDER = "#e6edf3", "#8b949e", "#30363d"
 ACCENT, OK, WARN, BAD = "#f0883e", "#3fb950", "#d29922", "#f85149"
 
-# Lines from the pipeline worth showing in the event list, and how to word them.
-# Everything else (per-frame OCR/debug chatter) stays out unless "Show all" is on.
 _TAGGED = (
     ("[seen again]", "Entry saved", "ok"),
     ("[NEW]", "Entry saved", "ok"),
@@ -94,15 +91,14 @@ def _redact(text):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Proactive Gas Station - Live Detection")
-        # Fit the screen: most of it, but never a window taller than the display.
+        self.title("RCVCI - Live Detection")
         width = min(1280, int(self.winfo_screenwidth() * 0.86))
         height = min(880, int(self.winfo_screenheight() * 0.88))
         self.geometry(f"{width}x{height}+{(self.winfo_screenwidth() - width) // 2}+{max(0, (self.winfo_screenheight() - height) // 3)}")
         self.minsize(860, 560)
         self.configure(bg=BG)
 
-        self._main = None                       # the detection module, imported in the background
+        self._main = None                     
         self._thread = None
         self._stop = threading.Event()
         self._events = queue.Queue()
@@ -166,7 +162,7 @@ class App(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill="x")
         ttk.Label(header, text="LIVE DETECTION", style="Eyebrow.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Proactive Gas Station", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text="RCVCI", style="Title.TLabel").pack(anchor="w")
 
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(12, 8))
@@ -206,8 +202,6 @@ class App(tk.Tk):
         self.crop_dir_btn.grid(row=2, column=3, padx=(8, 0), pady=(8, 0))
         self._sync_crop_controls()
 
-        # The parts under the video are packed first, from the bottom up, so a
-        # small window shrinks the video instead of pushing the status bar off.
         status = ttk.Frame(outer)
         status.pack(side="bottom", fill="x", pady=(8, 0))
         self.state_label = tk.Label(status, text="", bg=BG, fg=MUTED, font=("Segoe UI", 10), anchor="w")
@@ -310,7 +304,7 @@ class App(tk.Tk):
     # ------------------------------------------------------------ background
     def _load_models(self):
         try:
-            import main  # loads every model; slow, so it happens after the window is up
+            import main 
             self._main = main
             self._events.put(("ready", None))
         except Exception:
@@ -322,14 +316,11 @@ class App(tk.Tk):
             state = False
             if url:
                 try:
-                    # /api/visits now requires a staff login (the dashboard
-                    # got real authentication); /api/health is the
-                    # unauthenticated liveness check meant for exactly this.
                     state = requests.get(f"{url}/api/health", timeout=2).ok
                 except requests.RequestException:
                     state = False
             self._events.put(("backend", state))
-            for _ in range(16):          # re-check every ~8 s, but notice closing quickly
+            for _ in range(16):       
                 if self._closing:
                     return
                 time.sleep(0.5)
@@ -347,7 +338,7 @@ class App(tk.Tk):
             print(traceback.format_exc(), flush=True)
             self._events.put(("finished", "error"))
         finally:
-            self._main.stop_flag = True       # make sure the pipeline's worker threads end
+            self._main.stop_flag = True  
 
     # --------------------------------------------------------------- actions
     def _toggle_run(self):
@@ -413,7 +404,7 @@ class App(tk.Tk):
         finally:
             try:
                 self.after(30, self._tick)
-            except tk.TclError:          # window already destroyed
+            except tk.TclError:          
                 pass
 
     def _draw_frame(self):
@@ -431,7 +422,7 @@ class App(tk.Tk):
         photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
         self.canvas.delete("all")
         self.canvas.create_image(cw // 2, ch // 2, image=photo)
-        self._photo = photo                     # keep a reference or Tk drops the image
+        self._photo = photo                   
         if not self._has_frame:
             self._has_frame = True
             self._set_state("Running", OK)
@@ -474,8 +465,6 @@ class App(tk.Tk):
             pass
 
     def _draw_placeholder_after_run(self):
-        # keep the last frame on screen after the run ends; only show the
-        # prompt again if nothing was ever drawn
         if self._photo is None:
             self._draw_placeholder()
 
@@ -512,7 +501,7 @@ class App(tk.Tk):
 
 
 def main():
-    try:  # keep text crisp on high-DPI Windows displays
+    try: 
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:

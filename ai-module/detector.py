@@ -71,9 +71,7 @@ def find_plate_yolo_candidates(frame):
 
         if plate_w <= 0 or plate_h <= 0:
             continue
-        # Do not discard valid distant plates before the live pipeline has a
-        # chance to combine several frames.  The final absolute/relative gate
-        # is applied in main.py and is deliberately lower for this camera.
+        
         if area < max(350, w * h * 0.001):
             continue
         if plate_w / max(plate_h, 1) > 8 or plate_w / max(plate_h, 1) < 1.5:

@@ -1,10 +1,3 @@
-"""Thai license-plate recognition using the trained ``character.pt`` model.
-
-The model detects a character at a time for the registration and one province
-class for the province line.  Province output is deliberately a *suggestion*:
-the matching/review screen must let an operator confirm it.
-"""
-
 import os
 
 import torch
@@ -74,16 +67,6 @@ def _label(model, class_id):
 
 def _resolve_overlapping_characters(boxes):
     """Collapse duplicate detections that cover the same physical character.
-
-    ``model()`` runs per-class NMS, so two different classes proposed for the
-    same glyph (e.g. a blurry "0" the model also half-reads as "9") both
-    survive independently -- silently inflating the character count and, on
-    a short plate, pushing it over the maximum digit length into
-    "<invalid>".  Group boxes that heavily overlap and keep only the
-    strongest one.  When the top two candidates at one position are close in
-    confidence, the model is not actually sure which is right; drop that
-    position rather than let a marginal confidence edge become a "confirmed"
-    character the OCR pipeline then treats as certain.
     """
     remaining = sorted(boxes, key=lambda item: item[5], reverse=True)
     resolved, dropped_ambiguous = [], []
@@ -112,16 +95,6 @@ def _resolve_overlapping_characters(boxes):
 
 def _has_internal_gap(characters, weak_positions):
     """Detect a likely-missed character sitting between two accepted ones.
-
-    ``characters`` must already be sorted by x1.  A character rejected for
-    being under CHARACTER_MODEL_MIN_CONF simply vanishes from the assembled
-    plate with no trace that anything was there -- so a systematically
-    under-confident glyph (for example two "9"s the model only ever proposes
-    at ~0.2 confidence) silently and consistently shortens the plate instead
-    of ever surfacing as a failed read.  A weak detection whose center falls
-    strictly between two characters we did accept is strong evidence a real
-    character was missed, since there is no reason for a stray background
-    shape to land exactly in the middle of the plate's own text.
     """
     for left, right in zip(characters, characters[1:]):
         gap_left, gap_right = left[2], right[0]
@@ -135,18 +108,13 @@ def _has_internal_gap(characters, weak_positions):
 
 def recognize_thai_plate(crop):
     """Return plate text plus a non-authoritative province suggestion.
-
-    The return shape is stable even if inference cannot run:
-    ``{"plate": "", "confidence": 0.0, "province_code": "", ...}``.
     """
     empty = {"plate": "", "confidence": 0.0, "province_code": "", "province_confidence": 0.0}
     model = _get_model()
     if model is None or crop is None or crop.size == 0:
         return empty
     try:
-        # In debug mode retain weak detections in the log.  They are still
-        # excluded from the assembled plate below, so diagnostics cannot make
-        # the live recognizer less conservative.
+        
         inference_conf = 0.01 if DEBUG_THAI_PLATE else CHARACTER_MODEL_MIN_CONF
         result = model(crop, conf=inference_conf, iou=0.45, verbose=False)[0]
     except Exception as error:
@@ -172,11 +140,7 @@ def recognize_thai_plate(crop):
                 weak_positions.append((x1, x2))
             continue
         y_center = (y1 + y2) / 2
-        # A registration character detected inside the province band (or a
-        # province-line detection inside the registration band) is almost
-        # always the model firing on the wrong line's text.  Keep the two
-        # bands separate the same way the EasyOCR fallback crop is split, so
-        # a stray province letter can never be spliced into the plate text.
+        
         if is_char_class:
             if y_center >= split_y:
                 continue
@@ -188,8 +152,6 @@ def recognize_thai_plate(crop):
 
     characters, dropped_ambiguous = _resolve_overlapping_characters(characters)
 
-    # Registration characters are ordered horizontally.  Province classes are
-    # separate whole-line detections and never contribute to the plate text.
     characters.sort(key=lambda item: item[0])
     plate = "".join(item[4] for item in characters)
     confidence = sum(item[5] for item in characters) / len(characters) if characters else 0.0

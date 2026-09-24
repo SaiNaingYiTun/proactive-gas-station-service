@@ -16,12 +16,7 @@ load_dotenv()
 
 app = FastAPI()
 
-# The frontend runs on its own origin/port (Vite dev server, or wherever it's
-# hosted), so the browser needs this to call the API at all. Wide open for
-# now since the AI module's own detection endpoints below are still
-# unauthenticated machine-to-machine calls either way (see the security
-# review notes) -- tighten allow_origins to the real frontend origin(s) once
-# this goes beyond local/exhibition use.
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,59 +29,40 @@ supabase = create_client(
     os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 )
 
-# Two dependencies: any logged-in staff account, or specifically the owner.
-# Only dashboard-facing endpoints use these -- the AI module's own
-# POST /api/detection, PUT /api/exit and PATCH /api/entry/{id} below are
-# machine-to-machine calls, unrelated to a staff member being logged in, and
-# are left exactly as they were.
 require_auth = AuthDependency(require_owner=False).set_client(supabase)
 require_owner = AuthDependency(require_owner=True).set_client(supabase)
 
-# This camera's entry view usually has no visible plate, so an open visit
-# can only be matched to its eventual exit by colour/make. Bound that search
-# to a reasonable dwell window so a visit that got stuck open (a bug, or a
-# vehicle that never triggered an exit) can never be matched by accident
-# hours or days later.
+
 MATCH_MAX_DWELL_HOURS = 6
 
 
 class Detection(BaseModel):
     event_id: UUID
-    # Optional: this camera's entry view usually never shows a plate at all.
     plate_number: Optional[str] = None
     vehicle_type: str
     color: str = "unknown"
     make: str = "unknown"
     confidence: float
     camera_id: int
-    # When the camera actually captured this vehicle (UTC). The AI sends
-    # entry/exit only after tracking/colour/OCR settle, often seconds later,
-    # so the request's arrival time is not when the vehicle was there.
+    
     detected_at: Optional[datetime] = None
 
 
 class ExitDetection(BaseModel):
     event_id: UUID
     plate_number: str
-    # During single-camera testing this is the same camera ID used for entry.
     camera_id: int = 1
     confidence: Optional[float] = None
-    # Colour/make of the exiting vehicle -- since entry has no plate, these
-    # are what complete_active_visit matches against the open visits.
+    
     color: str = "unknown"
     make: str = "unknown"
-    # The event_id of the entry this same tracked vehicle already sent, when it
-    # sent one.  The AI knows exactly which entry an exit belongs to, so this is
-    # a direct link -- colour/make matching is only the fallback for a vehicle
-    # whose entry was never seen.
+    
     entry_event_id: Optional[UUID] = None
     detected_at: Optional[datetime] = None
 
 
 def event_time(detected_at: Optional[datetime]) -> str:
-    """ISO timestamp for an AI event: the camera's capture time when the AI
-    sent one, otherwise now. Always timezone-aware UTC -- a naive string
-    reads back with no offset and the browser then shows it as local time."""
+    """Return the ISO timestamp for an AI event."""
     if detected_at is None:
         return datetime.now(timezone.utc).isoformat()
     if detected_at.tzinfo is None:
@@ -108,21 +84,6 @@ def processed_visit_id(event_id: UUID):
 
 def _find_open_visit_candidates(data: ExitDetection):
     """Return open visits that could plausibly be this exiting vehicle.
-
-    Entry never has a plate on this camera, so plate can't be the join key
-    here -- match on colour/make instead, bounded to MATCH_MAX_DWELL_HOURS so
-    a long-stuck-open visit can never be matched by accident. When colour or
-    make itself is "unknown" on the EXIT side (classification never
-    resolved), that field is not used to filter -- an unknown is not
-    evidence of a mismatch, just missing information.
-
-    The entry side can just as easily be "unknown" -- entry is sent as soon
-    as colour is confident, often before make/model has resolved at all (see
-    _queue_entry_if_ready in the AI module), and colour itself can stay
-    unknown the same way. An open visit stored as unknown on either field is
-    therefore also accepted as a candidate whenever the exit does have a
-    real value for it, instead of being excluded by an exact-match filter
-    that unknown could never satisfy.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=MATCH_MAX_DWELL_HOURS)).isoformat()
     query = (
@@ -138,10 +99,7 @@ def _find_open_visit_candidates(data: ExitDetection):
         query = query.or_(f"vehicle_make.eq.{data.make},vehicle_make.eq.unknown")
     rows = query.execute().data
 
-    # A visit that actually agrees with the exit on colour/make is a better
-    # guess than one that merely couldn't disagree because it was unknown, so
-    # rank fewer-unknown-fields first. sort() is stable, so ties keep the
-    # oldest-entry-first (FIFO) order the query already returned.
+    
     def unknown_fields(row):
         return (
             (data.color != "unknown" and row["vehicle_color"] == "unknown")
@@ -153,11 +111,7 @@ def _find_open_visit_candidates(data: ExitDetection):
 
 
 def _own_open_visit(data: ExitDetection):
-    """The still-open visit this exiting vehicle's own entry event created, if any.
-
-    Guessing by colour/make alone picks the OLDEST matching open visit, so with
-    two similar cars open (or one stale visit from earlier) the exit closes the
-    wrong one and the visit that really just ended stays "inside" forever."""
+    """The still-open visit this exiting vehicle's own entry event created, if any."""
     if data.entry_event_id is None:
         return None
     visit_id = processed_visit_id(data.entry_event_id)
@@ -177,15 +131,6 @@ def _own_open_visit(data: ExitDetection):
 
 def complete_active_visit(data: ExitDetection):
     """Close the open visit for an exiting vehicle and log its exit.
-
-    A vehicle whose own entry was recorded closes exactly that visit.
-    Otherwise the oldest matching open visit is assumed to be the one leaving (FIFO).
-    When more than one open visit matches colour/make, the visit is still
-    closed automatically -- but flagged "ambiguous" so staff can double check
-    it later instead of trusting the guess silently. When nothing matches at
-    all, the exit is still recorded (as an "exit_only" visit with no
-    entry_time) rather than being discarded as an error -- a real detection
-    happened and should stay reviewable, even if its entry was never seen.
     """
     own_visit = _own_open_visit(data)
     candidates = [own_visit] if own_visit else _find_open_visit_candidates(data)
@@ -214,11 +159,7 @@ def complete_active_visit(data: ExitDetection):
             "visit_status": "completed",
             "match_status": match_status,
         }
-        # Entry is sent before colour/make necessarily resolves, so the
-        # visit may have been stored as "unknown" for a value the exit camera
-        # did read. Fill it in rather than leaving the completed visit
-        # showing "Unknown vehicle" -- but never overwrite a value the entry
-        # already had.
+        
         if best["vehicle_color"] == "unknown" and data.color != "unknown":
             updates["vehicle_color"] = data.color
         if best["vehicle_make"] == "unknown" and data.make != "unknown":
@@ -240,13 +181,7 @@ def save_detection(data: Detection):
     if duplicate_visit_id is not None:
         return {"status": "duplicate", "visit_id": duplicate_visit_id}
 
-    #entry camera
     if data.camera_id == 1:
-        # Entry never has a plate on this camera, so there is no reliable key
-        # to dedupe against an already-open visit -- always insert a fresh
-        # one. The AI side already guards against sending more than one
-        # entry per tracked vehicle; the check above already protects
-        # against a retried HTTP call for the same event.
         visit = (
             supabase.table("vehicle_visits")
             .insert({
@@ -262,7 +197,6 @@ def save_detection(data: Detection):
         )
         visit_id = visit.data[0]["id"]
 
-        #exit camera
     elif data.camera_id == 2:
         visit_id = complete_active_visit(ExitDetection(
             event_id=data.event_id,
@@ -280,11 +214,9 @@ def save_detection(data: Detection):
             "message":"Invalid camera_id"
         }
 
-    # The camera-ID 2 path already logged its exit in complete_active_visit.
     if data.camera_id == 2:
         return {"status": "saved", "visit_id": visit_id}
 
-    # Save entry detection event.
 
     supabase.table(
         "detection_events"
@@ -323,12 +255,6 @@ class EntryUpdate(BaseModel):
 @app.patch("/api/entry/{event_id}")
 def update_entry(event_id: UUID, data: EntryUpdate):
     """Fill in colour/make on an entry that was saved before they resolved.
-
-    The AI sends an entry as soon as colour is confident, which is usually a
-    moment before make has enough agreeing reads -- so the visit is stored
-    with make "unknown" and, without this, stays that way until the exit
-    fills it in. Same rule as complete_active_visit: only replace a value
-    that is still unknown, never one the entry already had.
     """
     visit_id = processed_visit_id(event_id)
     if visit_id is None:
@@ -358,11 +284,6 @@ def update_entry(event_id: UUID, data: EntryUpdate):
 @app.get("/api/visits")
 def list_visits(limit: int = 50, status: Optional[str] = None, account=Depends(require_auth)):
     """Recent vehicle visits for the dashboard, most recent entry first.
-
-    `status` filters on visit_status ("inside" / "completed") when given.
-    An "exit_only" visit (see complete_active_visit) has no entry_time, so
-    it sorts as if it were the oldest -- acceptable here since these are rare
-    and still show up in the list, just not necessarily at the very top.
     """
     query = supabase.table("vehicle_visits").select("*")
     if status:
@@ -377,11 +298,7 @@ def list_visits(limit: int = 50, status: Optional[str] = None, account=Depends(r
 
 @app.get("/api/health")
 def health_check():
-    """Whether the backend process AND its database connection are both up --
-    not just "did some request succeed", which the dashboard's old status
-    badges never actually checked at all (see the frontend review notes).
-    Unauthenticated on purpose: a viewer needs to see the backend is down
-    even when they cannot log in, and this exposes nothing sensitive."""
+    
     try:
         supabase.table("vehicle_visits").select("id").limit(1).execute()
         return {"status": "ok", "database": "ok"}
@@ -422,9 +339,7 @@ def _find_account_by_username(username: str):
 @app.post("/api/auth/login")
 def login(data: LoginRequest):
     account = _find_account_by_username(data.username)
-    # Verify against a real (if irrelevant) hash even on a missing username,
-    # so a wrong-username response takes about as long as a wrong-password
-    # one -- a bit of defence against timing-based username enumeration.
+    
     password_hash = account["password_hash"] if account else hash_password("")
     password_ok = verify_password(data.password, password_hash)
     if not account or not account["active"] or not password_ok:
@@ -444,12 +359,6 @@ class ChangePasswordRequest(BaseModel):
 
 @app.post("/api/auth/change-password")
 def change_own_password(data: ChangePasswordRequest, account=Depends(require_auth)):
-    """Any logged-in account changing its OWN password -- proves identity by
-    already being logged in plus re-entering its current password, same as
-    changing a password on most ordinary systems. This is separate from the
-    owner's staff-management endpoints below, which change ANOTHER
-    account's credentials and so need the stronger owner-identifies-itself
-    step described there."""
     if len(data.new_password) < 8:
         raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
     full = supabase.table("staff_accounts").select("password_hash").eq("id", account["id"]).limit(1).execute().data
@@ -465,14 +374,7 @@ def change_own_password(data: ChangePasswordRequest, account=Depends(require_aut
 # =============================================================
 # Staff management (owner only)
 # =============================================================
-#
-# Every account-modifying endpoint here takes owner_username/owner_password
-# and re-verifies them against the CALLER's own account, on top of the
-# require_owner dependency already checking the caller is logged in AS the
-# owner. This is deliberately redundant with being logged in: it is the
-# "the owner must identify themselves" step asked for, protecting against
-# the moment an owner's already-open session is sitting unattended and
-# someone else tries to use it to change a staff member's login.
+
 
 def _verify_owner_reauth(account, owner_username: str, owner_password: str):
     if owner_username != account["username"]:
@@ -519,9 +421,7 @@ def create_staff(data: CreateStaffRequest, account=Depends(require_owner)):
 
 
 class UpdateStaffRequest(BaseModel):
-    # All optional except the re-auth fields: send only what changes, e.g.
-    # repurposing a former employee's row just sets username/password/
-    # display_name for whoever replaces them.
+    
     username: Optional[str] = None
     password: Optional[str] = None
     display_name: Optional[str] = None

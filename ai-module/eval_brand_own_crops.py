@@ -1,18 +1,3 @@
-"""Evaluate a brand.pt checkpoint separately on your own camera crops vs
-CompCars images in val/, since Ultralytics' training-time top1_acc blends
-both together and can hide poor real-world performance.
-
-CompCars val images share the same easy, clean-studio distribution as
-CompCars train images, so high accuracy there says little about whether the
-model now recognizes brands from this camera's actual rear-view footage --
-the entire point of this fine-tune. This reports accuracy on each source
-separately, per class, so a misleadingly high blended number can't hide a
-model that only learned CompCars.
-
-Usage (from ai-module/, with the project venv active):
-    .venv/Scripts/python.exe eval_brand_own_crops.py <path_to_best.pt>
-"""
-
 import re
 import sys
 from pathlib import Path

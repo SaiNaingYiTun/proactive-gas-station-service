@@ -1,13 +1,5 @@
 import os
 
-# TCP blocks and waits for retransmission on any lost packet -- fine on a
-# solid link, but per-stage timing measurements showed camera reads (not any
-# AI processing) causing every FPS dip, up to several seconds each.  UDP
-# just drops/corrupts the affected frame instead of blocking -- an
-# occasional glitchy frame is a much better failure mode here than freezing
-# the app, especially since the pipeline already discards low-confidence/
-# implausible reads regardless.  Revert to "rtsp_transport;tcp" if corrupted
-# frames prove more disruptive than the stalls were.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
 
 import cv2
@@ -63,22 +55,13 @@ def set_crop_saving(enabled, directory=None):
         save_crops_dir = directory
 
 
-# Every OCR job carries the owning ByteTrack ID, preventing cross-car updates.
 ocr_queue = queue.Queue(maxsize=8)
-# Colour and make/model both used to run as direct GPU calls inside the main
-# video-loop thread, gated only by a throttle interval + "OCR not busy right
-# now" check.  Whenever that interval elapsed for one or more currently
-# visible vehicles, the main loop blocked on those calls before it could
-# read the next camera frame -- a periodic FPS dip independent of which
-# model was loaded, since it was a threading issue, not a model-quality
-# one.  Both now run on their own background thread instead, exactly like
-# OCR already does.
+
 attributes_queue = queue.Queue(maxsize=16)
 backend_queue = queue.Queue(maxsize=16)
 sessions_lock = threading.Lock()
 vehicle_sessions = {}
-# Maps replaced ByteTrack IDs to the current session key. OCR runs in another
-# thread, so its job can still refer to an ID that ByteTrack just replaced.
+
 session_aliases = {}
 stop_flag = False
 
@@ -135,9 +118,6 @@ def _get_session(track_id, now, box=None):
         if session is not None:
             return session
 
-        # A tracker ID can change while the same large vehicle is partially
-        # occluded or its box changes shape.  Reuse the old logical session so
-        # it cannot produce duplicate OCR, entry, or exit events.
         if box is not None:
             candidates = [
                 (old_track_id, old_session)
@@ -152,8 +132,7 @@ def _get_session(track_id, now, box=None):
                     key=lambda item: _box_iou(box, item[1]["box"]),
                 )
                 del vehicle_sessions[old_track_id]
-                # Keep queued OCR jobs for the old ID connected to this
-                # session after its ByteTrack ID is replaced.
+            
                 session_aliases[old_track_id] = track_id
                 for alias, target in list(session_aliases.items()):
                     if target == old_track_id:
@@ -186,25 +165,7 @@ def _classify_direction(box):
 
 
 def _attribute_ready(session, now):
-    """Whether this vehicle should be attempted yet for colour or make/model
-    -- both wait on the same direction-based rule (see
-    ENTRY_DIRECTION_SPLIT_Y's comment for why entering and exiting traffic
-    are handled oppositely): an entering vehicle is captured as soon as it
-    is trackable at all; an exiting vehicle keeps waiting for a legible
-    plate (the same "this is definitely a good view" signal OCR already
-    requires), with ATTRIBUTE_FALLBACK_SEC as a bounded worst case if its
-    plate is never found at all.
-
-    This does NOT check framing (see _vehicle_fully_framed) -- that check is
-    make-only. An edge-clipped crop (a door panel, a taillight -- see
-    VEHICLE_FRAME_EDGE_MARGIN's comment) has been observed making make/model
-    confidently wrong; colour has not shown the same failure (a car's colour
-    is usually still readable from a fragment of it), so it is not held back
-    by this on top of the direction-based wait, to avoid delaying it for a
-    problem with no evidence it actually has.
-
-    Must be called while holding sessions_lock (plate_box and is_entering
-    are both written under it)."""
+    """Whether this session has enough information to be sent to the backend."""
     if session["is_entering"]:
         return True
     return (
@@ -239,18 +200,10 @@ def _is_in_station_driveway(vehicle):
 
 
 def _queue_entry_if_ready(session):
-    """An entry is sent once colour is confident. Plate is intentionally not
-    required here -- this camera's entry view usually doesn't show it at
-    all, so the backend instead matches this entry to its eventual exit by
-    colour/make. Skip a session that is already armed to exit: a vehicle
-    re-tracked under a new ID while actually leaving would otherwise also
-    pass the colour check and be logged as a second, bogus entry for a
-    vehicle that is already inside."""
+    """Send the backend an entry event once this session has a colour and plate."""
     if session["entry_sent"] or session["color_conf"] < COLOR_MIN_CONF:
         return
     if session["exit_armed"]:
-        # Otherwise this is completely silent, and a car that simply never
-        # shows up on the dashboard looks like a backend or frontend bug.
         if not session["entry_skip_logged"]:
             session["entry_skip_logged"] = True
             print(
@@ -267,8 +220,6 @@ def _queue_entry_if_ready(session):
             "type": "entry", "event_id": event_id, "track_id": session["id"],
             "plate": session["plate"], "conf": session["plate_conf"],
             "color": session["color"], "make": session["make"],
-            # When the camera first saw this vehicle -- the entry itself is only
-            # sent once colour settles, which can be seconds later.
             "seen_at": session["first_seen"],
         })
         session["entry_sent"] = True
@@ -278,14 +229,7 @@ def _queue_entry_if_ready(session):
 
 
 def _queue_entry_update_if_needed(session):
-    """Tell the backend the make once it resolves after the entry went out.
-
-    The entry is sent the moment colour is confident, which is normally before
-    make has its agreeing reads, so it carries make "unknown".  Only the first
-    resolved make is sent -- the backend never overwrites a value the visit
-    already has.  Must be called while holding sessions_lock; the single
-    backend worker drains the queue in order, so this always lands after the
-    entry it refers to."""
+    """Send the backend an entry update if this session's make has changed."""
     if (
         not session["entry_sent"]
         or session["entry_make_sent"] != "unknown"
@@ -303,14 +247,7 @@ def _queue_entry_update_if_needed(session):
 
 
 def _queue_exit_if_needed(session, reason, seen_at):
-    """An exit is sent once this session has a plate, regardless of whether
-    this same session ever sent its own entry. A vehicle that entered
-    off-camera-view of the plate (see _queue_entry_if_ready) and is only
-    re-tracked once it reaches the exit corridor never has entry_sent=True
-    locally -- the backend still matches it to its real, earlier entry by
-    colour/make, so this session does not need to have "seen" that entry
-    itself. ``seen_at`` is the capture time of the frame the exit happened
-    on, not the (later) moment the exit is decided and sent."""
+    """Send the backend an exit event once this session has a plate and hasn't already sent one."""
     if session["exit_sent"] or not session["plate"]:
         return
     try:
@@ -332,11 +269,7 @@ def _has_pending_ocr_work():
 
 
 def _pending_work_remaining():
-    """Whether any OCR/colour/make job is still queued, or a finished one is
-    still on its way to the backend. Used only to give a video file a bounded
-    grace period at end-of-file (see FILE_EOF_DRAIN_TIMEOUT_SEC) instead of
-    tearing down the worker threads mid-job the instant the last frame is
-    read."""
+    """Return whether any queued or running job still needs the GPU."""
     if not (ocr_queue.empty() and attributes_queue.empty() and backend_queue.empty()):
         return True
     with sessions_lock:
@@ -357,15 +290,8 @@ def _build_detected_message(session, track_id):
 
 
 def _mark_detected_ready(session, now):
-    """Record the moment plate+colour both first became available.
-
-    The [DETECTED] print itself is deferred (see _detected_message_if_ready)
-    rather than fired here, so a make/model result that resolves moments
-    later on its own throttled schedule has a bounded chance to land in the
-    same summary line instead of that line always showing "unknown".  This
-    never delays the backend entry event -- _queue_entry_if_ready already
-    fires independently of this bookkeeping.
-    """
+    """Mark this session as ready to print a [DETECTED] line once its make/model has resolved or DETECTED_GRACE_SEC has elapsed.  Must be called while
+    holding sessions_lock."""
     if (
         session["detected_ready_at"] is None
         and session["plate"]
@@ -441,14 +367,7 @@ def _apply_make_result(session, track_id, make, mm_model, mm_conf, now):
 
 
 def attributes_worker():
-    """Run colour and make/model inference off the main video-loop thread.
-
-    Both used to run as direct synchronous GPU calls inside
-    _update_vehicle_session; this drains a queue of {type, track_id, crop}
-    jobs instead, so the main loop only ever has to enqueue (cheap) rather
-    than wait for a classifier forward pass before it can read the next
-    frame.
-    """
+    
     while not stop_flag:
         try:
             job = attributes_queue.get(timeout=1)
@@ -542,22 +461,13 @@ def ocr_worker():
                 trained_result["province_confidence"],
             )
             province_from_model = bool(province_raw)
-            # Always run EasyOCR too, rather than only when character.pt
-            # fails -- the two engines make different mistakes (character.pt
-            # confidently swaps 8/9/0; EasyOCR tends to add a stray digit or
-            # drop a letter instead), so the only way to catch character.pt
-            # being confidently WRONG is to have a second, independent
-            # reading to check it against every time, not just when it gives
-            # up. See plates_roughly_agree() for how the two are reconciled.
+            
             easy_plate, easy_conf = ocr_best(crop[:split, :], PLATE_NUMBER_ALLOWLIST)
             easy_plate = normalize_plate_text(easy_plate)
             char_ok = char_plate and char_conf >= OCR_MIN_CONF and is_plausible_plate_text(char_plate)
             easy_ok = easy_plate and easy_conf >= OCR_MIN_CONF and is_plausible_plate_text(easy_plate)
             if not char_ok and not easy_ok:
-                # Neither primary engine produced anything usable -- fall
-                # back to a heavier, upscaled EasyOCR pass, exactly as
-                # before. Nothing to cross-check this reading against, so it
-                # is offered on its own like any single-source read.
+                
                 alternate = normalize_plate_crop(crop[:split, :], target_w=1400)
                 candidates = []
                 if alternate is not None:
@@ -565,13 +475,13 @@ def ocr_worker():
                     alt_plate = normalize_plate_text(alt_plate)
                     if is_plausible_plate_text(alt_plate):
                         candidates = [(alt_plate, alt_conf)]
-                agree = True  # a single (or no) source -- nothing to disagree with
+                agree = True  
             elif char_ok and easy_ok:
                 agree = plates_roughly_agree(char_plate, easy_plate)
                 candidates = [(char_plate, char_conf), (easy_plate, easy_conf)]
             else:
                 candidates = [(char_plate, char_conf)] if char_ok else [(easy_plate, easy_conf)]
-                agree = True  # only one source read anything -- nothing to disagree with
+                agree = True  
             if ENABLE_PROVINCE_OCR and not province_from_model:
                 province_raw, province_conf = ocr_best(
                     crop[split:, :],
@@ -592,8 +502,7 @@ def ocr_worker():
 
         if not candidates and DEBUG_OCR_VERBOSE:
             print(f"[OCR] track={track_id} rejected: neither engine produced a usable read", flush=True)
-        # Province codes come from the trained model and are review hints, not
-        # an automatic final decision.  EasyOCR text still uses fuzzy matching.
+        
         province = province_raw if province_from_model else match_province(province_raw)
         now = time.time()
         with sessions_lock:
@@ -604,18 +513,7 @@ def ocr_worker():
                 hit = session["province_stabilizer"].offer(province, province_conf, province, now)
                 if hit:
                     province = hit["text"]
-            # Two candidates this attempt (character.pt and EasyOCR) means
-            # each is offered to the stabilizer separately -- when they
-            # genuinely agree, PlateStabilizer's own fuzzy matching merges
-            # them into the same growing candidate, so agreement can confirm
-            # a plate from a single attempt instead of needing two whole
-            # attempts to agree with only itself.  When they DISAGREE,
-            # `agree` is False and provisional_plate (the fast-vehicle,
-            # single-read escape hatch -- see SINGLE_READ_PROMOTION_MIN_CONF)
-            # deliberately does not update from this attempt: a vehicle that
-            # leaves before a second attempt ever runs must not have its one
-            # and only reading be one two independent engines actively
-            # disputed, even if that engine's own confidence looked high.
+            
             for plate, conf in candidates:
                 if agree and (
                     conf > session["provisional_conf"]
@@ -672,24 +570,7 @@ def _update_vehicle_session(vehicle, frame, now):
     crop = frame[max(0, vy):min(frame.shape[0], vy + vh), max(0, vx):min(frame.shape[1], vx + vw)]
     if crop.size == 0:
         return
-    # Colour and make/model are auxiliary metadata, handled identically:
-    # each is enqueued for the background attributes_worker thread rather
-    # than run inline here, so a classifier forward pass can never block
-    # this frame's read of the next camera frame -- only cheap bookkeeping
-    # (throttle/stability checks, an enqueue) happens in this thread. Never
-    # queue while an OCR job is active elsewhere (that GPU time stays
-    # reserved for plate/OCR), no more than once per interval, and never a
-    # second job for the same vehicle while one is already in flight. This
-    # no longer waits for this vehicle's entire first OCR attempt to finish
-    # first -- a fast vehicle can leave before that attempt (tracker
-    # collection + queueing + the OCR thread itself) ever completes, and
-    # previously meant colour, make, and therefore the backend entry event
-    # never ran at all.
-    # _has_pending_ocr_work() takes sessions_lock itself, so it must be
-    # called before entering the lock below -- threading.Lock is not
-    # reentrant, and nesting this call inside an already-held lock would
-    # deadlock the main video-loop thread the first time a colour/make job
-    # became eligible to enqueue.
+    
     ocr_busy = _has_pending_ocr_work()
     with sessions_lock:
         color_is_stable = session["color_conf"] >= COLOR_MIN_CONF
@@ -729,10 +610,7 @@ def _update_vehicle_session(vehicle, frame, now):
     in_exit_track_roi = ex1 <= center_x <= ex2 and ey1 <= center_y <= ey2
     detected_message = None
     with sessions_lock:
-        # Checked every frame this vehicle is visible, regardless of whether
-        # colour or make/model changed just now -- this is what lets the
-        # deferred [DETECTED] print fire either as soon as make resolves or
-        # once DETECTED_GRACE_SEC has elapsed, whichever comes first.
+        
         detected_message = _detected_message_if_ready(session, track_id, now)
         if in_exit_track_roi and center_y >= EXIT_ARM_Y:
             session["exit_armed"] = True
@@ -765,13 +643,7 @@ def _retire_missing_sessions(now):
                 and session["provisional_plate"]
                 and session["provisional_conf"] >= SINGLE_READ_PROMOTION_MIN_CONF
             ):
-                # This vehicle is leaving before the stabilizer collected its
-                # normal second confirming read -- typically a fast-moving
-                # car. Without this, it would leave with zero backend record
-                # at all: _queue_entry_if_ready only ever fires on a
-                # confirmed session["plate"]. Only promote a lone read this
-                # well above OCR_MIN_CONF, since it never gets the usual
-                # protection of a second agreeing read.
+                
                 session["plate"] = session["provisional_plate"]
                 session["province"] = session["provisional_province"]
                 session["plate_conf"] = session["provisional_conf"]
@@ -786,10 +658,7 @@ def _retire_missing_sessions(now):
                 _queue_entry_if_ready(session)
                 _mark_detected_ready(session, now)
             if not session["detected_logged"] and session["detected_ready_at"] is not None:
-                # Plate+colour were ready but the vehicle is leaving before
-                # DETECTED_GRACE_SEC elapsed or make/model resolved -- this
-                # is the last chance to print, so do it now with whatever
-                # make value (possibly still "unknown") is available.
+                
                 session["detected_logged"] = True
                 print(_build_detected_message(session, track_id), flush=True)
             elif (
@@ -797,10 +666,7 @@ def _retire_missing_sessions(now):
                 and not session["provisional_logged"]
                 and session["provisional_plate"]
             ):
-                # No longer gated on having exhausted every OCR attempt --
-                # a fast vehicle can retire long before OCR_MAX_JOBS_PER_TRACK
-                # jobs ever get submitted, and previously left with no trace
-                # at all in that case.
+                
                 session["provisional_logged"] = True
                 print(
                     f"[PROVISIONAL] track={track_id} "
@@ -810,8 +676,7 @@ def _retire_missing_sessions(now):
                     f"color={session['color']} color_conf={session['color_conf']:.2f}",
                     flush=True,
                 )
-            # Retired seconds after it was last on camera; stamp the exit with
-            # the last frame it was actually visible in.
+            
             _queue_exit_if_needed(session, "track_disappeared", session["last_seen"])
             del vehicle_sessions[track_id]
         for old_track_id in list(session_aliases):
@@ -886,19 +751,13 @@ def run_live(source=None, on_frame=None, should_stop=None):
     for worker in workers:
         worker.start()
     frame_count, fps_count, fps, last_fps_at, last_plate_box = 0, 0, 0.0, time.time(), None
-    # A live stream only ever hands over frames as fast as the camera itself
-    # produces them, so it's already paced. A file has no such limit --
-    # cv2.VideoCapture decodes it as fast as the CPU/GPU allow, which can run
-    # many times faster than the clip's own recording speed. That leaves the
-    # colour/make throttles and confirmation waits (all in real seconds, see
-    # config.py) far less real time per second of footage to do their job in,
-    # so pace file playback back down to the speed it was actually recorded at.
+    
     frame_interval = 0.0
     next_frame_due = time.time()
     if is_file:
         native_fps = cap.get(cv2.CAP_PROP_FPS)
         if not native_fps or native_fps <= 0:
-            native_fps = 25.0        # container didn't report a real value
+            native_fps = 25.0        
         frame_interval = 1.0 / native_fps
     hit_eof = False
     print(
@@ -927,11 +786,7 @@ def run_live(source=None, on_frame=None, should_stop=None):
             if stopping():
                 break
             continue
-        # Detection and tracking run on the downscaled frame, but plate crops
-        # for OCR are cut from the full-resolution one: the stream is 2560x1440
-        # and a plate that is only ~62px wide in the 1500-wide frame is ~106px
-        # wide here -- detail the character model/EasyOCR can never get back
-        # once it has been resized away.
+        
         native_frame = frame
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         frame_count, fps_count, now = frame_count + 1, fps_count + 1, time.time()
@@ -944,9 +799,7 @@ def run_live(source=None, on_frame=None, should_stop=None):
             vehicles = [vehicle for vehicle in vehicles if _is_in_station_driveway(vehicle)]
             x1, y1, x2, y2 = DETECTION_ROI
             plate_candidates = find_plate_yolo_candidates(frame[y1:y2, x1:x2])
-            # A road marking can occasionally have a higher plate-model score
-            # than the real registration.  Only use a candidate that belongs
-            # to one of the tracked vehicles in this frame.
+            
             for candidate_box, candidate_conf in plate_candidates:
                 candidate_box = (
                     candidate_box[0] + x1,
@@ -957,10 +810,7 @@ def run_live(source=None, on_frame=None, should_stop=None):
                 if _plate_vehicle_match(candidate_box, vehicles):
                     box, box_conf = candidate_box, candidate_conf
                     break
-        # Reset every frame rather than only on a new valid detection -- otherwise
-        # the green box drawn below keeps showing wherever the last valid plate
-        # was, even after that vehicle has left or the plate is no longer found,
-        # which looks like a wrong/stale detection on the current vehicle.
+        
         last_plate_box = None
         if box:
             x, y, w, h = box
@@ -993,8 +843,7 @@ def run_live(source=None, on_frame=None, should_stop=None):
                                 pass
                 last_plate_box = box
 
-        # Submit plate/OCR work before any secondary vehicle attributes.  A
-        # colour inference can therefore never delay this frame's plate job.
+        
         for vehicle in vehicles:
             _update_vehicle_session(vehicle, frame, now)
         _retire_missing_sessions(now)
@@ -1024,7 +873,7 @@ def run_live(source=None, on_frame=None, should_stop=None):
             if delay > 0:
                 time.sleep(delay)
             else:
-                next_frame_due = time.time()   # fell behind (slow inference) -- resync instead of trying to catch up
+                next_frame_due = time.time()   
         if on_frame is not None:
             on_frame(frame)
             continue
@@ -1037,19 +886,13 @@ def run_live(source=None, on_frame=None, should_stop=None):
             filename = f"screenshot_{datetime.now().strftime('%H%M%S')}.jpg"
             cv2.imwrite(filename, frame)
             print(f"Saved {filename}", flush=True)
-    # A file reaching its last frame is not the same as the user asking to
-    # stop -- give the workers a bounded chance to actually finish OCR/colour/
-    # make and reach the backend for whatever vehicle was still in flight,
-    # instead of dropping it the instant the last frame was read. A manual
-    # Stop (or 'q') skips this: that is a deliberate stop, not a surprise one.
+    
     if hit_eof and _pending_work_remaining():
         print("Finishing in-progress detections...", flush=True)
         deadline = time.time() + FILE_EOF_DRAIN_TIMEOUT_SEC
         while _pending_work_remaining() and time.time() < deadline and not stopping():
             time.sleep(0.2)
-    # Tell the worker threads to finish and wait for them, so a run started
-    # again straight afterwards (the desktop app's Stop then Start) never has
-    # two sets of workers competing for the same queues.
+    
     stop_flag = True
     cap.release()
     for worker in workers:

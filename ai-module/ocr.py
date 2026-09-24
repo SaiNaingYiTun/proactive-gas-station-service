@@ -47,9 +47,7 @@ def ocr_best(crop, allowlist, threshold=0.25, normalizer=normalize_plate_text, v
             cv2.imwrite(fname, processed)
 
         try:
-            # EasyOCR can generate a zero-height internal text box from a
-            # degenerate plate crop. Convert its RuntimeWarning to a handled
-            # exception, so it cannot clutter the terminal or stop OCR.
+            
             with warnings.catch_warnings():
                 warnings.simplefilter("error", RuntimeWarning)
                 results = reader.readtext(
@@ -66,25 +64,18 @@ def ocr_best(crop, allowlist, threshold=0.25, normalizer=normalize_plate_text, v
                     adjust_contrast=0.7,
                 )
         except (cv2.error, OverflowError, RuntimeWarning, ValueError) as error:
-            # EasyOCR occasionally produces an empty internal text crop for a
-            # tiny/degenerate detection.  This must not terminate ocr_worker.
             if DEBUG_OCR_SAVE_VARIANTS:
                 print(f"[OCR] variant {idx}: OpenCV error skipped: {error}")
             continue
         if not results:
             continue
 
-        # EasyOCR may return the Thai prefix and digits as separate words.
-        # Evaluate both each word and the left-to-right joined text.
+        
         ordered = sorted(results, key=lambda item: min(point[0] for point in item[0]))
         candidates = [(text, float(conf)) for _, text, conf in ordered]
         if len(ordered) > 1:
             joined_text = "".join(text for _, text, _ in ordered)
-            # A plate's Thai prefix and its digits are frequently separate
-            # EasyOCR detections.  The minimum confidence makes the complete
-            # joined reading always lose to one isolated character, so use a
-            # conservative average and give valid registration shapes priority
-            # below.  The raw OCR confidence is still returned to the caller.
+            
             joined_conf = sum(float(conf) for _, _, conf in ordered) / len(ordered)
             candidates.append((joined_text, joined_conf))
 
@@ -93,10 +84,7 @@ def ocr_best(crop, allowlist, threshold=0.25, normalizer=normalize_plate_text, v
             if not clean or (validator is not None and not validator(clean)):
                 continue
 
-            # Prefer a complete, plausible plate over a high-confidence
-            # fragment such as "5".  This only affects the selection; the
-            # caller still receives the unmodified OCR confidence and applies
-            # OCR_MIN_CONF before accepting the result.
+            
             score = value + min(len(clean), 8) * 0.02
             if normalizer is normalize_plate_text and is_plausible_plate_text(clean):
                 score += 2.0

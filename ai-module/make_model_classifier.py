@@ -47,14 +47,7 @@ def _get_brand_model():
 
 
 def _infer_classify(model, body):
-    """brand.pt as a whole-image classifier (``model.task == 'classify'``).
-
-    Restricted to BRAND_ALLOWLIST and renormalized (see its definition in
-    config.py for why): the un-fine-tuned model is a 161-class public
-    classifier, most of which this station will never actually see, so its
-    raw top1 is frequently an irrelevant class that merely faced less
-    competition than the real answer.
-    """
+    """brand.pt as a whole-image classifier (``model.task == 'classify'``)."""
     result = model(body, verbose=False)[0]
     names = model.names
     if result.probs is None:
@@ -85,10 +78,7 @@ def _infer_classify(model, body):
     if total <= 0:
         return "unknown", 0.0
     make, raw_conf = max(allowed, key=lambda item: item[1])
-    # A raw share this small means the model gave this class no real
-    # attention -- renormalizing among 14 equally-negligible candidates can
-    # still produce a large-looking confidence (see BRAND_ALLOWLIST_MIN_RAW_CONF
-    # in config.py), so require genuine signal before trusting it at all.
+    
     if raw_conf < BRAND_ALLOWLIST_MIN_RAW_CONF:
         return "unknown", 0.0
     confidence = raw_conf / total
@@ -121,27 +111,14 @@ def _infer_detect(model, body):
 
 
 def infer_make_model(vehicle_crop, track_id=None):
-    """Return (make, model, confidence) with a safe unknown fallback.
-
-    ``brand.pt`` has been swapped between a *detector* over a small set of
-    badge/logo classes and a whole-image *classifier* over a much larger
-    manufacturer list -- branch on ``model.task`` so either kind of weights
-    works without another code change the next time it's replaced.  The
-    model field stays "unknown" until a model-level (e.g. "Hilux", "Civic")
-    classifier exists; callers and the stabilizer already treat (make,
-    model) as one pair, so this keeps that contract without inventing one.
-    """
+    """Return (make, model, confidence) with a safe unknown fallback."""
     if vehicle_crop is None or vehicle_crop.size == 0:
         return "unknown", "unknown", 0.0
     model = _get_brand_model()
     if model is None:
         return "unknown", "unknown", 0.0
     try:
-        # Save the full, untrimmed crop for debug/dataset purposes -- on a
-        # detector box that's already tight around the vehicle,
-        # _vehicle_body_crop's trim cuts into the car itself rather than
-        # just background/foliage, which is exactly wrong for a debug image
-        # meant to be inspected or hand-labeled later.
+        
         if DEBUG_MAKE_MODEL_SAVE_INPUTS and vehicle_crop.size:
             os.makedirs("./debug_crops", exist_ok=True)
             label = track_id if track_id is not None else "na"
@@ -153,7 +130,6 @@ def infer_make_model(vehicle_crop, track_id=None):
             make, confidence = _infer_detect(model, body)
         return make, "unknown", confidence
     except Exception as error:
-        # A model/runtime error on one frame must not stop the LPR pipeline;
-        # the caller already treats "unknown" as a safe no-op result.
+        
         print(f"[MAKE] inference skipped: {error}", flush=True)
         return "unknown", "unknown", 0.0

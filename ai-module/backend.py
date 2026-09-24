@@ -32,9 +32,6 @@ def send_detection(event_id, plate, conf, color="unknown", make="unknown", seen_
             f"{api_base}/api/detection",
             json={
                 "event_id": event_id,
-                # This camera's entry view usually has no visible plate; send
-                # None rather than "" so the backend stores a real NULL and
-                # matches this entry to its exit by colour/make instead.
                 "plate_number": plate or None,
                 "vehicle_type": "car",
                 "color": color,
@@ -52,7 +49,6 @@ def send_detection(event_id, plate, conf, color="unknown", make="unknown", seen_
 
 
 def send_entry_update(event_id, color="unknown", make="unknown"):
-    """Fill in colour/make on an entry already sent with them still unknown."""
     if not enabled:
         return None
     try:

@@ -38,7 +38,7 @@ function AppLayout({ children }) {
           <div>
 
             <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[#5F6771]">
-              Proactive Gas Station
+              RCVCI
             </p>
 
             <p className="mt-1 text-sm font-medium text-[#B9BFC6]">

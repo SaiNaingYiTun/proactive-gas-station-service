@@ -36,12 +36,7 @@ class PlateStabilizer:
         if best_key is not None and best_score >= self.similarity_threshold:
             return best_key
 
-        # OCR commonly varies by one Thai letter or one serial digit on a
-        # small, tilted plate (for example "บว1433" vs "ทว1430").  Treat
-        # those as one candidate only when they have the same length, at
-        # least three digits, and agree on at least 75% of the digit string.
-        # This is intentionally narrower than lowering the general text
-        # similarity threshold, which would also merge unrelated provinces.
+        
         digits = "".join(char for char in text if char.isdigit())
         if len(digits) >= 3:
             for candidate_key in self._candidates:
@@ -52,22 +47,7 @@ class PlateStabilizer:
                 if digit_score >= 0.75:
                     return candidate_key
 
-        # The trained character model can also miss exactly one digit at the
-        # very start or end of an otherwise-correct plate -- typically the
-        # last digit, when it is small, blurry, or its confidence lands just
-        # under the detector's own per-character threshold.  It has also been
-        # seen to simultaneously misread a repeated-letter prefix as a single
-        # different letter (for example "ฆฆ5176" read a second time as
-        # "ม517": the model detected "ฆ" twice but at ~0.06 confidence, below
-        # the character-confidence gate, and never proposed a box for the
-        # trailing "6" at all), so this intentionally does not require the
-        # letter portion -- or even the total length -- to agree; each
-        # PlateStabilizer instance already belongs to one tracked vehicle, so
-        # there is no unrelated plate for a stray digit-prefix match to
-        # collide with.  Only merge when one read's digit string is a prefix
-        # or suffix of the other's and they differ by exactly one digit --
-        # this forgives a single dropped digit, never a genuinely different
-        # serial.
+        
         if len(digits) >= 3:
             for candidate_key in self._candidates:
                 candidate_digits = "".join(char for char in candidate_key if char.isdigit())
@@ -103,9 +83,6 @@ class PlateStabilizer:
         candidate["hits"] += 1
         previous_best_conf = candidate["best_conf"]
         candidate["best_conf"] = max(candidate["best_conf"], conf)
-        # OCR can read a real plate correctly once, then later drop a digit
-        # with a slightly higher confidence.  Never replace a longer plate
-        # reading with its shorter fragment merely because of confidence.
         if len(text) > len(candidate["best_text"]) or (
             len(text) == len(candidate["best_text"])
             and conf >= previous_best_conf

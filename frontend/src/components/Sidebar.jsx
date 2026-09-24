@@ -52,7 +52,7 @@ function Sidebar() {
         </p>
 
         <h1 className="mt-3 text-[20px] font-semibold tracking-[-0.02em] text-[#F4F5F6]">
-          Proactive Gas Station
+          RCVCI
         </h1>
 
         <p className="mt-2 text-xs text-[#656D77]">

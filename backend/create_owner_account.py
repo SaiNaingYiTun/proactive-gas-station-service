@@ -1,15 +1,3 @@
-"""Create the first owner account for the staff dashboard.
-
-Run this once, after applying migrations/002_staff_accounts.sql, with
-backend/.env filled in (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET).
-It refuses to run if an owner account already exists -- to replace the owner
-account itself, edit the row directly in Supabase, or delete it first and
-re-run this script.
-
-Usage (from backend/, with the same Python that runs the backend):
-    python create_owner_account.py
-"""
-
 import getpass
 import sys
 

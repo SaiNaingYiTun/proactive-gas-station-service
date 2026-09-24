@@ -15,7 +15,6 @@ def resize_to_target(gray, target_w):
     h, w = gray.shape[:2]
     if w > 0 and w < target_w:
         scale = target_w / w
-        # Limit magnification to 4x to avoid destroying tiny detections
         scale = min(scale, 4.0)
         new_w = int(w * scale)
         gray = cv2.resize(gray, (new_w, max(1, int(h * scale))), interpolation=cv2.INTER_CUBIC)
@@ -80,8 +79,7 @@ def get_plate_preprocess_variants(crop, target_w=1000):
 
 
 def normalize_plate_crop(crop, target_w=1000):
-    # Default to the mild CLAHE/sharpen version so Thai characters are not destroyed
-    # before OCR. The OCR layer will try grayscale and binary variants too.
+
     return prepare_clahe_variant(crop, target_w=target_w)
 
 
@@ -94,10 +92,7 @@ def sharpness_score(crop):
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-# cv2.putText's Hershey fonts have no Thai glyphs, so every Thai letter in a
-# plate label is drawn as "?".  Thai text goes through Pillow instead, onto
-# just the label's own patch of the frame (converting the whole frame every
-# frame would be needlessly slow).
+
 _THAI_FONT_CANDIDATES = (
     "C:/Windows/Fonts/tahomabd.ttf",
     "C:/Windows/Fonts/tahoma.ttf",
@@ -127,11 +122,6 @@ def _get_thai_font(size=15):
 
 
 def put_label(frame, text, org, color=(0, 255, 255)):
-    """Draw ``text`` with its baseline-left corner at ``org``, Thai included.
-
-    ASCII-only labels keep the original cv2.putText look; anything else uses a
-    Thai-capable font, falling back to cv2.putText (Thai shown as "?") only if
-    Pillow or every candidate font is missing."""
     font = None if text.isascii() else _get_thai_font()
     if font is None:
         cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)

@@ -23,12 +23,6 @@ def _safe_scalar(value, index=0):
 
 
 def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
-    """Return the most confident vehicle whose centre is in the entry ROI.
-
-    ``frame`` should be the complete camera frame.  Detecting on a cropped
-    entry rectangle clips vehicles at its boundary and makes the resulting box
-    unsuitable for colour classification.
-    """
     results = vehicle_model(frame, conf=min_conf, iou=0.45, verbose=False)[0]
 
     candidates = []
@@ -43,18 +37,13 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
         try:
             cls = int(cls_value)
             conf = float(conf_value)
-            # ``xyxy`` contains four coordinates, not a single scalar.
-            # _safe_scalar() is suitable for class/confidence tensors only;
-            # using it here discards every vehicle detection.
+            
             x1, y1, x2, y2 = map(float, box.xyxy[0])
         except (TypeError, ValueError):
             continue
 
         label = vehicle_model.names[cls]
-        # Motorcycles are excluded: this station's plate/colour/make pipeline
-        # is built for four-wheeled vehicles, and a motorcycle's rear view
-        # rarely has a legible full plate in the same position, wasting a
-        # tracked session and OCR attempts on a vehicle type it can't serve.
+       
         if label.lower() not in {"car", "truck", "bus"}:
             continue
 
@@ -64,8 +53,7 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
 
         if width <= 0 or height <= 0:
             continue
-        # Distant vehicles at the top of the driveway are smaller than the
-        # close-up van, but still large enough for a useful colour crop.
+        
         if area < (w * h * 0.002):
             continue
 
@@ -84,7 +72,6 @@ def find_vehicle_yolo(frame, min_conf=0.30, entry_roi=None):
     if not candidates:
         return None, 0.0
 
-    # Confidence is primary; use area as a stable tie-breaker.
     conf, area, x1, y1, x2, y2 = max(candidates, key=lambda v: (v[0], v[1]))
     return (x1, y1, x2 - x1, y2 - y1), conf
 
@@ -125,10 +112,7 @@ def find_vehicle_tracks(frame, min_conf=0.30):
         except (TypeError, ValueError):
             continue
 
-        # Motorcycles are excluded: this station's plate/colour/make pipeline
-        # is built for four-wheeled vehicles, and a motorcycle's rear view
-        # rarely has a legible full plate in the same position, wasting a
-        # tracked session and OCR attempts on a vehicle type it can't serve.
+        
         if vehicle_model.names[cls].lower() not in {"car", "truck", "bus"}:
             continue
         width, height = x2 - x1, y2 - y1

@@ -35,7 +35,7 @@ function Login() {
             JUST
           </p>
           <h1 className="mt-3 text-2xl font-semibold text-[#F4F5F6]">
-            Proactive Gas Station
+            RCVCI
           </h1>
           <p className="mt-2 text-sm text-[#656D77]">
             Sign in to the operations console
