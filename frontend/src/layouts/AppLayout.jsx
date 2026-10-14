@@ -1,7 +1,6 @@
 import { useState } from 'react'
 
 import {
-  Bell,
   ChevronDown,
   CircleUserRound,
   LogOut,
@@ -65,17 +64,6 @@ function AppLayout({ children }) {
                 {healthy === null ? 'Checking…' : healthy ? 'Live System' : 'Backend Unreachable'}
               </span>
             </div>
-
-
-            {/* Notification */}
-            <button
-              type="button"
-              className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-[#252A30] bg-[#111419] text-[#858D97] transition hover:border-[#343A42] hover:text-white"
-            >
-              <Bell size={17} />
-
-              <span className="absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-[#D98A32]"></span>
-            </button>
 
 
             {/* User */}

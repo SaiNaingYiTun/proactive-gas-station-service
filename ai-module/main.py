@@ -147,19 +147,11 @@ def _get_session(track_id, now, box=None):
 
 
 def _vehicle_fully_framed(box, margin=VEHICLE_FRAME_EDGE_MARGIN):
-    """Whether this vehicle's box sits clear of every frame edge.
-
-    See VEHICLE_FRAME_EDGE_MARGIN in config.py for why a box touching the
-    frame boundary means the crop is a fragment of the vehicle, not the whole
-    thing."""
     x, y, w, h = box
     return x > margin and y > margin and x + w < FRAME_W - margin and y + h < FRAME_H - margin
 
 
 def _classify_direction(box):
-    """Guess whether a freshly-created session is entering from the road or
-    already inside and now leaving, from where its box first sits within
-    VEHICLE_ENTRY_ROI. See ENTRY_DIRECTION_SPLIT_Y in config.py."""
     _, y, _, h = box
     return y + h / 2 < ENTRY_DIRECTION_SPLIT_Y
 
@@ -706,8 +698,6 @@ def _redact_credentials(url):
 
 
 def _reset_run_state():
-    """Start every run from a clean slate: a second run from the desktop app
-    must not inherit the previous run's vehicles, queued jobs or track IDs."""
     with sessions_lock:
         vehicle_sessions.clear()
         session_aliases.clear()
@@ -721,12 +711,6 @@ def _reset_run_state():
 
 
 def run_live(source=None, on_frame=None, should_stop=None):
-    """Run detection on ``source`` (default: the configured camera).
-
-    With no arguments this is the original OpenCV-window loop.  The desktop app
-    (app.py) instead passes ``on_frame`` -- called with each annotated frame in
-    place of the window -- and ``should_stop`` -- polled every frame.  A video
-    file ends the run when it finishes; a live stream reconnects."""
     global stop_flag
     source = CAMERA_INDEX if source is None else source
     use_window = on_frame is None
