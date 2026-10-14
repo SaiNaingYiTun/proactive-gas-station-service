@@ -216,7 +216,7 @@ Camera links, plate images, training datasets and model weights are kept out of 
 ## Team
 
 - Sai Naing Yi Tun
-- [Team member]
-- [Team member]
+- May Thu Khin
+- San Lin Htet
 
-Advisor: [Advisor name]
+Advisor: Dr. Chayapol Moemeng
